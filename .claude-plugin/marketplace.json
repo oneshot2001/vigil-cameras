@@ -1,0 +1,5 @@
+{
+  "name": "vigil-cameras",
+  "owner": { "name": "oneshot2001" },
+  "plugins": [{ "name": "vigil-cameras", "source": "./" }]
+}
