@@ -31,4 +31,4 @@ While developing: `claude --plugin-dir /path/to/vigil-cameras`.
 
 ## Status
 
-v0.2: grid of tiles, one publisher per camera, Axis RTSP URLs. Planned: reconnect verification, latency measurement, Vigil-native decode and ONVIF analytics boxes.
+v0.2.1: grid of tiles, one publisher per camera, Axis RTSP URLs. Reconnect verified (stall → live again in ~13 s, ffmpeg exit → ~8 s). Command-to-glass latency measured at ~0.4 s (PTZ nudge on a Q6358-LE, 1280×720 at 15 fps, cmux 0.65.2, 2026-11-01; the figure includes the PTZ motor's own start delay), down from ~1.45 s before the decoder ran with `low_delay` (no frame threading). Planned: Vigil-native decode and ONVIF analytics boxes.

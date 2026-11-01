@@ -149,6 +149,7 @@ class Publisher:
 def spawn_ffmpeg(url_file, w, h):
     argv = [FFMPEG, "-hide_banner", "-loglevel", "error", "-nostdin",
             "-f", "concat", "-safe", "0", "-protocol_whitelist", "file,rtsp,tcp,udp,rtp",
+            "-flags", "low_delay",   # disables frame threading, which held N decoded frames back (~1 s at 15 fps); slice threads stay, codec-required B-frame reordering remains
             "-i", url_file,
             "-vf", f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:-1:-1",
             "-fps_mode", "passthrough",   # the camera paces at `fps`; an fps filter added ~1.1 s of start latency and 34 dup frames
