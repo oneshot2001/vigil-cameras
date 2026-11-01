@@ -1,23 +1,30 @@
 import type { Register } from 'claude-code'
 
-// vigil-cameras v0.2: a grid of live camera tiles in a pane.
+// vigil-cameras v0.3: a grid of live camera tiles in a pane, with ONVIF analytics boxes.
 // /cam                 every camera in the registry
 // /cam <id> [<id>…]    just those (one id = single tile at 1280×720)
 // /cam add <id>…       /cam rm <id>…
+// /cam boxes [<id>…] live|aligned|off   boxes mode for those tiles (default: every tile); they restart
 // /cam off             stop every stream and close the pane
-// Frames: one libexec/campub.py per tile (ffmpeg → fresh POSIX shm per frame) → $.ui.blit.
+// Frames: one libexec/campub.py per tile (RTSP → PyAV decode → boxes burned in → fresh POSIX shm per
+// frame; ffmpeg instead when boxes are off) → $.ui.blit.
 
 const PANE = 'cameras'
 const CELL_ASPECT = 2.14 // cell height ÷ cell width; no API reports it (mobile-mcp hardcodes the same)
 const BLACK = { rgba: 'AAAAAA==', width: 1, height: 1 } as const // 1×1 placeholder until the first blit
 const SINGLE = [1280, 720] as const
 const GRID = [640, 360] as const
+const MODES = ['live', 'aligned', 'off'] as const
+type Mode = (typeof MODES)[number]
+let defaultMode: Mode = 'live' // `/cam boxes <mode>` with no ids also sets the mode new tiles start in
 
 type Tile = {
   camera: string
   width: number
   height: number
   state: string
+  boxes: Mode
+  stats?: { boxes: string; objects?: number; box_age_ms?: number | null; note?: string } // the publisher's once-a-second report
   child?: AsyncGenerator<any, any> // the live spawn stream; return() kills the publisher
   running?: Promise<void>          // settles when the stream loop has wound down
   stop: boolean
@@ -56,6 +63,24 @@ function fit(bodyColumns: number, bodyRows: number | undefined, n: number, w: nu
   return { columns, rows, cols: g.cols }
 }
 
+// "q6325 · live · boxes aligned · 3 obj · 0.5 s" — the publisher reports the mode it actually runs
+// (off when PyAV is missing or the camera has no metadata track).
+function header(t: Tile, columns: number) {
+  const parts = [t.camera, t.state]
+  const s = t.stats
+  if (t.state === 'live' && t.boxes !== 'off') {
+    parts.push(`boxes ${s?.boxes ?? t.boxes}`)
+    if (s?.boxes && s.boxes !== 'off') {
+      parts.push(`${s.objects ?? 0} obj`)
+      if (s.boxes === 'live' && s.box_age_ms != null) parts.push(`${(s.box_age_ms / 1000).toFixed(1)} s`)
+    }
+  }
+  let line = parts.join(' · ')
+  if (line.length > columns && parts.length > 4) line = parts.slice(0, -1).join(' · ') // narrow tile: drop the age before cutting a number in half
+  if (line.length > columns) line = line.replace('boxes ', '')
+  return line.slice(0, columns)
+}
+
 async function registry($: any): Promise<string[]> {
   const path = (await $.env.get('VIGIL_CAMERAS_JSON')) || `${await $.env.get('HOME')}/Projects/onvif-mcp/cameras.json`
   return Object.keys(JSON.parse(await $.fs.read(path)))
@@ -90,6 +115,7 @@ async function stream($: any, t: Tile) {
       '--camera', t.camera,
       '--size', `${t.width}x${t.height}`,
       '--fps', '15',
+      '--boxes', t.boxes,
     ],
   })
   t.child = proc
@@ -122,6 +148,10 @@ async function stream($: any, t: Tile) {
           if (msg.error) $.ui.log(`campub ${t.camera}: ${msg.error}`, { to: 'debug' })
           $.ui.invalidate('ui.render')
           status($, true)
+        } else if (msg.stats) {
+          if (msg.stats.note && msg.stats.note !== t.stats?.note) $.ui.log(`campub ${t.camera}: ${msg.stats.note}`, { to: 'debug' })
+          t.stats = msg.stats
+          $.ui.invalidate('ui.render')
         }
       }
     }
@@ -155,7 +185,11 @@ async function apply($: any, cameras: string[]) {
   const keep = tiles.filter(t => cameras.includes(t.camera) && t.width === w && t.height === h)
   const leaving = tiles.filter(t => !keep.includes(t))
   tiles = cameras.map(
-    c => keep.find(t => t.camera === c) ?? { camera: c, width: w, height: h, state: 'starting', stop: false, blits: 0, denied: 0, fps: '0 fps' },
+    c =>
+      keep.find(t => t.camera === c) ?? {
+        camera: c, width: w, height: h, state: 'starting', stop: false, blits: 0, denied: 0, fps: '0 fps',
+        boxes: leaving.find(t => t.camera === c)?.boxes ?? defaultMode, // a tile recreated at the other size keeps its mode
+      },
   )
   since = Date.now() // a fresh sampling window: an idle span before this would read as a low rate
   $.ui.invalidate('ui.render')
@@ -166,6 +200,20 @@ async function apply($: any, cameras: string[]) {
       t.running = stream($, t).catch(() => undefined)
     }
   }
+}
+
+// Restart the given tiles with a new boxes mode; the others keep streaming.
+async function setMode($: any, which: Tile[], mode: Mode) {
+  for (const t of which) t.boxes = mode
+  await Promise.all(which.map(stopTile))
+  since = Date.now()
+  for (const t of which) {
+    t.stop = false
+    t.state = 'starting'
+    t.stats = undefined
+    t.running = stream($, t).catch(() => undefined)
+  }
+  $.ui.invalidate('ui.render')
 }
 
 async function stopAll($: any) {
@@ -179,8 +227,8 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'cam',
-      description: 'Live camera pane: /cam, /cam <id>…, /cam add|rm <id>…, /cam off',
-      argumentHint: '[<id>… | add <id>… | rm <id>… | off]',
+      description: 'Live camera pane: /cam, /cam <id>…, /cam add|rm <id>…, /cam boxes [<id>…] live|aligned|off, /cam off',
+      argumentHint: '[<id>… | add <id>… | rm <id>… | boxes [<id>…] live|aligned|off | off]',
     })
     return next(e)
   })
@@ -194,6 +242,18 @@ export const register: Register = on => {
         await stopAll($)
         await $.ui.close({ id: PANE })
         return { text: 'Camera pane closed.' }
+      }
+      if (words[0] === 'boxes') {
+        const mode = words[words.length - 1] as Mode
+        if (words.length < 2 || !MODES.includes(mode)) return { text: 'Usage: /cam boxes [<id>…] live|aligned|off' }
+        const ids = words.slice(1, -1)
+        const named = ids.length ? tiles.filter(t => ids.includes(t.camera)) : tiles
+        const which = named.filter(t => t.boxes !== mode || !t.running) // already in that mode and streaming: leave it alone
+        const missing = ids.filter(id => !tiles.some(t => t.camera === id))
+        if (missing.length) return { text: `Not on screen: ${missing.join(', ')}. Showing: ${current.join(', ') || 'nothing'}.` }
+        if (!ids.length) defaultMode = mode
+        await setMode($, which, mode)
+        return { text: which.length ? `Boxes ${mode} on ${which.map(t => t.camera).join(', ')}.` : named.length ? `Boxes already ${mode} on ${named.map(t => t.camera).join(', ')}.` : `Boxes ${mode} for the next /cam.` }
       }
       const known = await registry($)
       if (words[0] === 'add') cameras = [...current, ...words.slice(1)]
@@ -239,7 +299,7 @@ export const register: Register = on => {
             {line.flatMap((t, ci) => {
               const tile = (
                 <Box key={`tile:${t.camera}`} flexDirection="column">
-                  <Text dimColor>{`${t.camera} · ${t.state}`.slice(0, columns)}</Text>
+                  <Text dimColor>{header(t, columns)}</Text>
                   <Image key={`cam-${t.camera}`} source={BLACK} columns={columns} rows={rows} alt={`live view of ${t.camera}`} />
                 </Box>
               )

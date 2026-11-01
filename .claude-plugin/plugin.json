@@ -1,5 +1,5 @@
 {
   "name": "vigil-cameras",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Live IP camera tiles in a Claude Code pane (ffmpeg → POSIX shm → Image blit)."
 }
