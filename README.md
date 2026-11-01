@@ -10,9 +10,11 @@ At the prompt of a Claude Code terminal session:
 /plugin install vigil-cameras --marketplace oneshot2001/vigil-cameras
 ```
 
-Answer `y` to add the marketplace, then pick a scope. From a shell: `claude plugin install vigil-cameras --marketplace oneshot2001/vigil-cameras`. The repository is private: installing needs read access on GitHub and a git credential for github.com on the machine (`gh auth login` then `gh auth setup-git`).
+Answer `y` to add the marketplace, then pick a scope. From a shell: `claude plugin install vigil-cameras --marketplace oneshot2001/vigil-cameras`.
 
 While developing: `claude --plugin-dir /path/to/vigil-cameras`.
+
+Then write a camera registry (see `cameras.example.json`) and point `VIGIL_CAMERAS_JSON` and `VIGIL_CRED_CMD` at your file and your password store, as described under Needs.
 
 ## Use
 
@@ -31,10 +33,16 @@ While developing: `claude --plugin-dir /path/to/vigil-cameras`.
 
 - A terminal that draws kitty graphics from shared memory: kitty, Ghostty, cmux. Not tmux, ssh, iTerm2 or the desktop app.
 - `python3` ≥ 3.13 on PATH and `~/.local/bin/ffmpeg` (override with `VIGIL_FFMPEG`).
-- A camera registry at `~/Projects/onvif-mcp/cameras.json` (override with `VIGIL_CAMERAS_JSON`): `{ "<id>": { "base": "http://<ip>", "user": "...", "credKey": "..." } }`.
-- `~/.claude/bin/cred get <credKey>` returning the camera password. With boxes off the password goes to ffmpeg through a 0600 file that is deleted once the stream is live; with boxes on it never leaves the publisher process (RTSP digest computed in-process, core dumps disabled). It is never in argv.
+- A camera registry, a JSON file at `$VIGIL_CAMERAS_JSON` (default `~/Projects/onvif-mcp/cameras.json`): `{ "<id>": { "base": "http://<ip>", "user": "...", "credKey": "..." } }`. `cameras.example.json` is a template. Extra keys are ignored. Only Axis RTSP URLs are built so far.
+- A password command: `$VIGIL_CRED_CMD` is run with the camera's `credKey` appended and must print the password on stdout. Default `~/.claude/bin/cred get`. On macOS the keychain works as is: store each password with `security add-generic-password -s <credKey> -a <user> -w` and set `VIGIL_CRED_CMD="security find-generic-password -w -s"`. Passwords never sit in the registry or in argv. With boxes off the password goes to ffmpeg through a 0600 file that is deleted once the stream is live; with boxes on it never leaves the publisher process (RTSP digest computed in-process, core dumps disabled).
 - For boxes: PyAV (`pip3 install av`; on a Homebrew Python add `--user --break-system-packages`). Without it a tile says so in the debug log and runs without boxes. The camera must offer an ONVIF analytics metadata track on the same RTSP session (Axis: `analytics=polygon`); the publisher reads the camera capture time from the RTP `0xABAC` header extension (`onvifreplayext=1`) to match documents to frames.
 
 ## Status
 
-v0.3.1: grid of tiles (2 columns up to 4 cameras, 3 beyond; six tiles verified 2026-11-01 at ~11 % of one core), one publisher per camera, Axis RTSP URLs, ONVIF analytics boxes (`live` / `aligned` / `off`). Reconnect verified (stall → live again in ~13 s, ffmpeg exit → ~8 s). Command-to-glass latency measured at ~0.27 s with boxes live and ~0.4 s with boxes off (PTZ nudge on a Q6358-LE, 1280×720 at 15 fps, cmux 0.65.2, 2026-11-01; the figure includes the PTZ motor's own start delay). A hot-reload of the plugin closes the pane and clears the status line (the publishers die with the old module). Not done: class text labels, track IDs, non-Axis RTSP dialects, HEVC/AV1.
+v0.3.2: grid of tiles (2 columns up to 4 cameras, 3 beyond; six tiles verified 2026-11-01 at ~11 % of one core), one publisher per camera, Axis RTSP URLs, ONVIF analytics boxes (`live` / `aligned` / `off`). Reconnect verified (stall → live again in ~13 s, ffmpeg exit → ~8 s). Command-to-glass latency measured at ~0.27 s with boxes live and ~0.4 s with boxes off (PTZ nudge on a Q6358-LE, 1280×720 at 15 fps, cmux 0.65.2, 2026-11-01; the figure includes the PTZ motor's own start delay). A hot-reload of the plugin closes the pane and clears the status line (the publishers die with the old module). Not done: class text labels, track IDs, non-Axis RTSP dialects, HEVC/AV1.
+
+Built with Claude Code, with OpenAI's Codex reading each change before it landed. Three cameras, one terminal, one person: it draws boxes, it does not record, and it is not a product.
+
+## License
+
+MIT, see `LICENSE`.

@@ -18,8 +18,10 @@ Two paths:
                    analytics boxes whose tt:Frame UtcTime equals that capture time (aligned)
                    or the newest ones (live). Needs `pip3 install av`; without it the tile
                    falls back to the ffmpeg path and says so.
-Credentials: cameras.json names a cred key; the password is fetched here with
-~/.claude/bin/cred. Python >= 3.13 (multiprocessing.shared_memory track=False).
+Credentials: cameras.json names a cred key; the password is fetched here by running
+$VIGIL_CRED_CMD with the key appended (default `~/.claude/bin/cred get`; e.g. the macOS
+keychain: `security find-generic-password -w -s`) and reading its stdout.
+Python >= 3.13 (multiprocessing.shared_memory track=False).
 """
 import sys
 
@@ -37,6 +39,7 @@ import os
 import re
 import resource
 import secrets
+import shlex
 import signal
 import socket
 import struct
@@ -50,7 +53,7 @@ from multiprocessing import shared_memory
 from urllib.parse import quote, urljoin, urlsplit
 
 REGISTRY = os.environ.get("VIGIL_CAMERAS_JSON", os.path.expanduser("~/Projects/onvif-mcp/cameras.json"))
-CRED = os.path.expanduser("~/.claude/bin/cred")
+CRED_CMD = os.environ.get("VIGIL_CRED_CMD", "~/.claude/bin/cred get")   # parsed in password(), inside the error handler
 FFMPEG = os.environ.get("VIGIL_FFMPEG", os.path.expanduser("~/.local/bin/ffmpeg"))
 CONNECT_S = 15.0 # first frame: RTSP setup + encoder spin-up measured at 4.5-5.8 s on the Q6358 (2026-10-23)
 STALL_S = 5.0    # no frame for this long once live -> restart
@@ -110,8 +113,19 @@ def redact(text):
 
 
 def password(cam):
-    pw = subprocess.run([CRED, "get", cam["credKey"]], capture_output=True, text=True, check=True,
-                        timeout=CRED_TIMEOUT_S).stdout.strip()
+    cmd = shlex.split(CRED_CMD)   # ValueError on an unmatched quote: reported by the caller's handler
+    if not cmd:
+        raise ValueError("VIGIL_CRED_CMD is empty")
+    cmd[0] = os.path.expanduser(cmd[0])
+    try:
+        pw = subprocess.run(cmd + [cam["credKey"]], capture_output=True, text=True, check=True,
+                            timeout=CRED_TIMEOUT_S).stdout.rstrip("\r\n")   # keep any spaces the password has
+    except subprocess.CalledProcessError as e:   # neither error repeats argv: the command may carry a store token
+        raise RuntimeError(f"{cmd[0]} exited {e.returncode} for credKey {cam['credKey']!r}") from None
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"{cmd[0]} took more than {CRED_TIMEOUT_S} s for credKey {cam['credKey']!r}") from None
+    if not pw:
+        raise ValueError(f"{cmd[0]} printed no password for credKey {cam['credKey']!r}")
     for s in (pw, quote(pw, safe="")):
         if s not in SECRETS:
             SECRETS.append(s)

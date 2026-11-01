@@ -1,0 +1,4 @@
+{
+  "front": { "base": "http://192.0.2.10", "user": "viewer", "credKey": "cam-front" },
+  "yard":  { "base": "http://192.0.2.11", "user": "viewer", "credKey": "cam-yard" }
+}
