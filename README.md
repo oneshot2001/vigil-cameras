@@ -16,9 +16,11 @@ While developing: `claude --plugin-dir /path/to/vigil-cameras`.
 
 ## Use
 
-- `/cam` or `/cam <camera-id>` opens the Cameras pane and streams that camera (default `q6358`).
-- `/cam off` stops the stream and closes the pane.
-- The status line shows the blit rate; the pane's first row shows camera, state and tile size.
+- `/cam` opens the Cameras pane with every camera in the registry, in a grid (2 columns up to 4 tiles, 3 beyond) at 640×360 per tile.
+- `/cam <id> [<id>…]` shows just those cameras; a single camera draws one tile at 1280×720.
+- `/cam add <id>…` and `/cam rm <id>…` change the set without restarting the tiles that stay, except when the count crosses one camera: the tile resolution changes, so the stayer restarts (about 5 s black).
+- `/cam off` stops every stream and closes the pane. Closing the pane by hand does the same.
+- The status line shows each tile's blit rate or state; each tile's header row shows camera and state.
 
 ## Needs
 
@@ -29,4 +31,4 @@ While developing: `claude --plugin-dir /path/to/vigil-cameras`.
 
 ## Status
 
-v0.1: one tile, Axis RTSP URLs. Planned: grid of tiles, reconnect tuning, Vigil-native decode and ONVIF analytics boxes.
+v0.2: grid of tiles, one publisher per camera, Axis RTSP URLs. Planned: reconnect verification, latency measurement, Vigil-native decode and ONVIF analytics boxes.
