@@ -1,6 +1,6 @@
 import type { Register } from 'claude-code'
 
-// vigil-cameras v0.3: a grid of live camera tiles in a pane, with ONVIF analytics boxes.
+// vigil-cameras v0.3.1: a grid of live camera tiles in a pane, with ONVIF analytics boxes.
 // /cam                 every camera in the registry
 // /cam <id> [<id>…]    just those (one id = single tile at 1280×720)
 // /cam add <id>…       /cam rm <id>…
@@ -75,9 +75,13 @@ function header(t: Tile, columns: number) {
       if (s.boxes === 'live' && s.box_age_ms != null) parts.push(`${(s.box_age_ms / 1000).toFixed(1)} s`)
     }
   }
+  // Narrow tile: drop whole parts from the end (age, count, boxes) rather than cut a number in half or
+  // leave "live · live" (the word "boxes" is what gives the second "live" its meaning).
   let line = parts.join(' · ')
-  if (line.length > columns && parts.length > 4) line = parts.slice(0, -1).join(' · ') // narrow tile: drop the age before cutting a number in half
-  if (line.length > columns) line = line.replace('boxes ', '')
+  while (line.length > columns && parts.length > 2) {
+    parts.pop()
+    line = parts.join(' · ')
+  }
   return line.slice(0, columns)
 }
 
@@ -225,6 +229,10 @@ async function stopAll($: any) {
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
+    // A hot-reload starts this module over with no tiles (the publishers die with the old module) while the
+    // engine keeps the old status line and pane: clear both so nothing stale stays on screen.
+    $.ui.status(undefined)
+    if ((await $.ui.panes()).some((p: { id: string }) => p.id === PANE)) await $.ui.close({ id: PANE })
     await $.command.register({
       name: 'cam',
       description: 'Live camera pane: /cam, /cam <id>…, /cam add|rm <id>…, /cam boxes [<id>…] live|aligned|off, /cam off',
