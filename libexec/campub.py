@@ -5,19 +5,26 @@ object, one JSON line per frame on stdout for the pane mod to blit.
   campub.py --camera q6358 [--tile 0] [--size 640x360] [--fps 15] [--boxes live|aligned|off]
 
 Lines:  {"tile":0,"shm":"/vc3f9a1c-0-17","w":640,"h":360}
-        {"tile":0,"state":"connecting|live|reconnecting|stopped|error","camera":"q6358",...}
-        {"tile":0,"stats":{"boxes":"live","objects":3,"box_age_ms":480,"meta_lag_ms":560,"held":0,"unmatched":2}}
+        {"tile":0,"state":"connecting|live|reconnecting|stopped|error","camera":"q6358","ctl":"/…/ctl.json",...}
+        {"tile":0,"stats":{"boxes":"live","objects":3,"box_age_ms":480,"meta_lag_ms":560,"held":0,"unmatched":2,"size":"1280x720"},"ctl":"…"}
+        {"tile":0,"swap":{"size":"640x360","state":"starting|connecting|reconnecting|done|error",...}}
 
-Two paths:
-  --boxes off      ffmpeg decodes the RTSP stream (v0.2). The password reaches ffmpeg
-                   through a 0600 concat list file, never argv.
-  --boxes live|aligned
-                   this process speaks RTSP itself (TCP interleaved, MD5 digest), depacketizes
+Control (v0.4): the publisher owns a small JSON file, `ctl` on every state/stats line. The mod
+writes the whole desired state to it, `{"boxes":"live|aligned|off","size":"WxH"}`, and the
+publisher reads it every 0.25 s. A boxes change is applied on the running stream. A size
+change opens a second RTSP session at the new size beside the running one and hands
+publication over once it has a decoded frame (the "swap" lines), so nothing goes black;
+the old session is then closed.
+
+Two decoders:
+  PyAV present     this process speaks RTSP itself (TCP interleaved, MD5 digest), depacketizes
                    H.264, decodes with PyAV (libavcodec in-process) so every frame keeps its
                    camera capture time (RTP 0xABAC header extension), and draws the ONVIF
                    analytics boxes whose tt:Frame UtcTime equals that capture time (aligned)
-                   or the newest ones (live). Needs `pip3 install av`; without it the tile
-                   falls back to the ffmpeg path and says so.
+                   or the newest ones (live), or none (off). All three modes run on one stream.
+  PyAV missing     ffmpeg decodes the RTSP stream (v0.2). The password reaches ffmpeg
+                   through a 0600 concat list file, never argv. Boxes are off and the tile
+                   says so. Needs `pip3 install av` for boxes.
 Credentials: cameras.json names a cred key; the password is fetched here by running
 $VIGIL_CRED_CMD with the key appended (default `~/.claude/bin/cred get`; e.g. the macOS
 keychain: `security find-generic-password -w -s`) and reading its stdout.
@@ -59,7 +66,12 @@ CONNECT_S = 15.0 # first frame: RTSP setup + encoder spin-up measured at 4.5-5.8
 STALL_S = 5.0    # no frame for this long once live -> restart
 STALE_S = 0.2    # an unread object older than this was never going to be read (blit denied) -> replace it
 CRED_TIMEOUT_S = 10
+CRED_GRACE_S = 0.1   # after the helper exits, its written bytes are already in the pipe; a descendant still holding it is not the credential
 BACKOFF = (1, 2, 4, 8, 10)
+TICK_S = 0.25    # the control file is read, and swaps are driven, this often
+MODES = ("live", "aligned", "off")
+MAX_DIM = 4096   # the control file may ask for any size up to the cameras' own 4K ceiling
+CTL = None       # path of the control file, on every state/stats line
 
 stop = threading.Event()   # set from normal code (broken pipe); never from a signal handler
 SIGNALLED = False           # Event.set() is not signal-safe (non-reentrant lock): handlers flip a plain flag
@@ -78,7 +90,7 @@ def stopping():
     return SIGNALLED or stop.is_set()
 
 
-def pause(seconds):
+def pause(seconds, stopping=stopping):
     end = time.monotonic() + seconds
     while not stopping() and time.monotonic() < end:
         time.sleep(0.25)
@@ -88,20 +100,34 @@ SECRETS = []  # raw and percent-encoded forms of every credential fetched, for r
 
 os.set_blocking(1, False)   # a reader that stopped reading must never pin us past SIGTERM
 
+EMIT_LOCK = threading.Lock()   # stream threads and the main thread all emit
+_PENDING = [b""]               # the tail of a record cut by a full pipe; goes out before the next record
 
-def emit(**kv):
-    """One JSON line on stdout; never blocks. A line cut by a full pipe or by `stop`
-    is dropped or left partial, which the mod's JSON parse ignores."""
-    data = (json.dumps(kv, separators=(",", ":")) + "\n").encode()
+
+def _write_out(data):
+    """Writes as much of `data` as the pipe takes; the rest waits in _PENDING. True when all went."""
     while data and not stopping():
         try:
             n = os.write(1, data)
         except BlockingIOError:
-            return
+            _PENDING[0] = bytes(data)
+            return False
         except BrokenPipeError:
             stop.set()
-            return
+            return False
         data = data[n:]
+    _PENDING[0] = b""
+    return not data
+
+
+def emit(**kv):
+    """One JSON line on stdout; never blocks. When the reader is behind, a whole record is
+    dropped rather than a record cut in two: a cut tail is finished before the next record goes."""
+    data = (json.dumps(kv, separators=(",", ":")) + "\n").encode()
+    with EMIT_LOCK:
+        if _PENDING[0] and not _write_out(_PENDING[0]):
+            return
+        _write_out(data)
 
 
 def redact(text):
@@ -112,18 +138,55 @@ def redact(text):
     return text
 
 
-def password(cam):
+def password(cam, stopping=stopping):
+    """Runs $VIGIL_CRED_CMD <credKey>. The child is watched, not waited on: a stop request kills it
+    at once, so no credential helper outlives the publisher."""
     cmd = shlex.split(CRED_CMD)   # ValueError on an unmatched quote: reported by the caller's handler
     if not cmd:
         raise ValueError("VIGIL_CRED_CMD is empty")
     cmd[0] = os.path.expanduser(cmd[0])
+    p = subprocess.Popen(cmd + [cam["credKey"]], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                         start_new_session=True)   # its own process group: a kill reaches any descendant holding the pipe
+    chunks = []
+
+    def reader():   # the pipe is read on its own thread, so neither the helper nor a descendant can block the stream
+        fd = p.stdout.fileno()
+        try:
+            while True:
+                b = os.read(fd, 4096)
+                if not b:
+                    return
+                chunks.append(b)
+        except OSError:
+            return
+
+    t = threading.Thread(target=reader, daemon=True)
+    t.start()
+    deadline = time.monotonic() + CRED_TIMEOUT_S
+    exited_at = None
+    while True:
+        if exited_at is None and p.poll() is not None:
+            exited_at = time.monotonic()
+        if exited_at is not None and (not t.is_alive() or time.monotonic() - exited_at > CRED_GRACE_S):
+            break   # the helper is gone and its output is in (EOF), or a descendant kept the pipe open: that is not the credential
+        if stopping() or time.monotonic() > deadline:
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            p.wait()
+            if stopping():
+                raise RuntimeError("stopping")
+            raise RuntimeError(f"{cmd[0]} took more than {CRED_TIMEOUT_S} s for credKey {cam['credKey']!r}")
+        time.sleep(0.05)   # not join(): once the reader has hit EOF a join returns at once and this loop would spin
     try:
-        pw = subprocess.run(cmd + [cam["credKey"]], capture_output=True, text=True, check=True,
-                            timeout=CRED_TIMEOUT_S).stdout.rstrip("\r\n")   # keep any spaces the password has
-    except subprocess.CalledProcessError as e:   # neither error repeats argv: the command may carry a store token
-        raise RuntimeError(f"{cmd[0]} exited {e.returncode} for credKey {cam['credKey']!r}") from None
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(f"{cmd[0]} took more than {CRED_TIMEOUT_S} s for credKey {cam['credKey']!r}") from None
+        os.killpg(p.pid, signal.SIGKILL)   # whatever the helper left behind holding its stdout
+    except ProcessLookupError:
+        pass
+    p.stdout.close()
+    if p.returncode != 0:   # the message never repeats argv: the command may carry a store token
+        raise RuntimeError(f"{cmd[0]} exited {p.returncode} for credKey {cam['credKey']!r}")
+    pw = b"".join(chunks).decode("utf-8", "replace").rstrip("\r\n")   # keep any spaces the password has
     if not pw:
         raise ValueError(f"{cmd[0]} printed no password for credKey {cam['credKey']!r}")
     for s in (pw, quote(pw, safe="")):
@@ -132,21 +195,81 @@ def password(cam):
     return pw
 
 
-def rtsp_url(cam, w, h, fps):
+def rtsp_url(cam, w, h, fps, stopping=stopping):
     host = urlsplit(cam["base"]).hostname
-    pw = password(cam)
+    pw = password(cam, stopping)
     user_q, pw_q = quote(cam["user"], safe=""), quote(pw, safe="")
     return f"rtsp://{user_q}:{pw_q}@{host}/axis-media/media.amp?videocodec=h264&resolution={w}x{h}&fps={fps}"
 
 
+class Want:
+    """The desired (boxes, w, h); the tuple is replaced whole, so a reader sees one state or the other."""
+
+    def __init__(self, v):
+        self.v = v
+
+
+class Control:
+    """Reads the control file every tick and moves `want` to it. Any torn or invalid content is
+    skipped; the next tick sees the finished write. Compared as raw bytes so an unchanged file
+    costs one small read and no parse."""
+
+    def __init__(self, path, want):
+        self.path, self.want, self.applied = path, want, None
+
+    def poll(self):
+        try:
+            with open(self.path, "rb") as f:
+                raw = f.read(4096)
+        except OSError:
+            return False
+        if not raw or raw == self.applied:
+            return False
+        try:
+            d = json.loads(raw)
+            boxes = d["boxes"]
+            w, h = (int(x) for x in str(d["size"]).lower().split("x"))
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return False
+        if boxes not in MODES or not (1 <= w <= MAX_DIM and 1 <= h <= MAX_DIM):
+            return False
+        self.applied = raw
+        if self.want.v == (boxes, w, h):
+            return False
+        self.want.v = (boxes, w, h)
+        return True
+
+
 class Publisher:
-    def __init__(self, tile, w, h):
-        self.tile, self.w, self.h = tile, w, h
+    """Writes frames to fresh shm objects. Exactly one stream, the owner, may publish or report;
+    ownership moves under the lock, so a stream being retired mid-frame publishes nothing."""
+
+    def __init__(self, tile):
+        self.tile = tile
         self.ns = secrets.token_hex(3)   # per-publisher namespace: two sessions never share a name
         self.last = None                 # (name, monotonic time written)
         self.n = 0
+        self.lock = threading.Lock()
+        self.owner = None
 
-    def publish(self, frame):
+    def publish(self, stream, frame, w, h):
+        with self.lock:
+            if self.owner is not stream:
+                return False
+            return self._publish(frame, w, h)
+
+    def promote(self, stream):
+        """Hands publication to `stream` and shows its ready frame at once. False, and nothing
+        changes, when the frame is gone (the stream disconnected since the caller looked)."""
+        with self.lock:
+            frame = stream.ready        # streams clear `ready` under this same lock
+            if frame is None:
+                return False
+            self.owner = stream
+            self._publish(frame, stream.w, stream.h)
+            return True
+
+    def _publish(self, frame, w, h):
         if self.last:
             name, t = self.last
             try:
@@ -168,22 +291,80 @@ class Publisher:
         shm.buf[: len(frame)] = frame
         shm.close()
         self.last = (name, time.monotonic())
-        emit(tile=self.tile, shm="/" + name, w=self.w, h=self.h)
+        emit(tile=self.tile, shm="/" + name, w=w, h=h)
         return True
 
     def cleanup(self):
-        if not self.last:
-            return
+        with self.lock:
+            self.owner = None
+            if not self.last:
+                return
+            try:
+                s = shared_memory.SharedMemory(name=self.last[0], track=False)
+                s.close()
+                s.unlink()
+            except FileNotFoundError:
+                pass
+            self.last = None
+
+
+class Stream(threading.Thread):
+    """One camera connection at one size, reconnecting on its own. While it is not the
+    Publisher's owner it keeps its newest frame in `ready` (None whenever it is not connected)
+    and reports its state as `swap` lines; as owner it publishes and reports normally."""
+
+    def __init__(self, a, cam, want, pub, w, h, tmp):
+        super().__init__(daemon=True)
+        self.a, self.cam, self.want, self.pub, self.w, self.h, self.tmp = a, cam, want, pub, w, h, tmp
+        self.stop_flag = False
+        self.ready = None
+        self.stats_due = False   # set by main at promotion: report at once, not at the next second
+        self.error = None
+        self.done = False
+
+    @property
+    def size(self):
+        return (self.w, self.h)
+
+    def stopping(self):
+        return stopping() or self.stop_flag
+
+    def stop(self):
+        self.stop_flag = True
+
+    def sink(self, rgb):
+        if self.pub.owner is self:
+            self.pub.publish(self, rgb, self.w, self.h)
+        else:
+            self.ready = rgb
+
+    def clear_ready(self):
+        """Not connected: nothing to promote. Under the publisher's lock so promote() cannot read a frame
+        that is being withdrawn."""
+        with self.pub.lock:
+            self.ready = None
+
+    def say(self, **kv):
+        """A state or stats line, from the owner only; a warming stream's state goes out as `swap`.
+        The lock is held through the write so a stream retired mid-call cannot speak after its successor."""
+        with self.pub.lock:
+            if self.pub.owner is self:
+                emit(tile=self.a.tile, camera=self.a.camera, ctl=CTL, **kv)
+                return
+        if "state" in kv:
+            emit(tile=self.a.tile, swap={"size": f"{self.w}x{self.h}", **kv})
+
+    def run(self):
         try:
-            s = shared_memory.SharedMemory(name=self.last[0], track=False)
-            s.close()
-            s.unlink()
-        except FileNotFoundError:
-            pass
-        self.last = None
+            self.body()
+        except Exception as e:   # cred failure, bad registry entry, ffmpeg missing: main reports it
+            self.error = redact(f"{type(e).__name__}: {e}")
+        finally:
+            self.clear_ready()
+            self.done = True
 
 
-# ---------------------------------------------------------------- ffmpeg path (--boxes off)
+# ---------------------------------------------------------------- ffmpeg path (PyAV missing)
 
 def spawn_ffmpeg(url_file, w, h):
     argv = [FFMPEG, "-hide_banner", "-loglevel", "error", "-nostdin",
@@ -216,78 +397,86 @@ def read_errors(proc, errors):
         errors.append(redact(line.decode("utf-8", "replace").rstrip()))
 
 
-def run_ffmpeg(a, cam, pub, w, h):
-    tmp = tempfile.mkdtemp(prefix="campub-")
-    url_file = os.path.join(tmp, "in.txt")
-    size = w * h * 3
-    attempt = 0
-    proc = None
-    try:
-        while not stopping():
-            url = rtsp_url(cam, w, h, a.fps)
-            if stopping():
-                break
-            fd = os.open(url_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(fd, "w") as f:
-                f.write(f"file '{url}'\noption rtsp_transport tcp\noption fflags nobuffer\n")
-            del url
-            emit(tile=a.tile, state="connecting", camera=a.camera, attempt=attempt)
-            if stopping():
-                break
-            proc = spawn_ffmpeg(url_file, w, h)
-
-            latest = [None]
-            got_frame = threading.Event()
-            errors = deque(maxlen=5)
-            rt = threading.Thread(target=read_frames, args=(proc, size, latest, got_frame), daemon=True)
-            et = threading.Thread(target=read_errors, args=(proc, errors), daemon=True)
-            rt.start()
-            et.start()
-
-            last = time.monotonic()
-            live = False
-            while not stopping():
-                if got_frame.wait(0.25):
-                    got_frame.clear()
-                    pub.publish(latest[0])
-                    last = time.monotonic()
-                    if not live:
-                        live = True
-                        attempt = 0
-                        try:
-                            os.unlink(url_file)   # ffmpeg has it open; the password leaves the disk
-                        except FileNotFoundError:
-                            pass
-                        emit(tile=a.tile, state="live", camera=a.camera)
-                if proc.poll() is not None:
-                    break
-                limit = STALL_S if live else CONNECT_S
-                if time.monotonic() - last > limit:
-                    errors.append(f"no frame for {limit:.0f}s")
-                    break
-            proc.kill()
-            proc.wait()
-            rt.join(2)        # its pipe closed with the process; never let it read the next one's bytes
-            et.join(2)
-            if stopping():
-                break
-            delay = BACKOFF[min(attempt, len(BACKOFF) - 1)]
-            attempt += 1
-            emit(tile=a.tile, state="reconnecting", camera=a.camera, attempt=attempt, delay=delay,
-                 error=redact("; ".join(errors)))
-            pause(delay)
-    finally:
-        if proc is not None and proc.poll() is None:
-            proc.kill()
-            proc.wait()
+class FfmpegStream(Stream):
+    def body(self):
+        a, cam, w, h = self.a, self.cam, self.w, self.h
+        url_file = os.path.join(self.tmp, f"in-{secrets.token_hex(3)}.txt")
+        size = w * h * 3
+        attempt = 0
+        proc = None
         try:
-            os.unlink(url_file)
-        except FileNotFoundError:
-            pass
-        os.rmdir(tmp)
+            while not self.stopping():
+                self.clear_ready()
+                url = rtsp_url(cam, w, h, a.fps, self.stopping)
+                if self.stopping():
+                    break
+                fd = os.open(url_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "w") as f:
+                    f.write(f"file '{url}'\noption rtsp_transport tcp\noption fflags nobuffer\n")
+                del url
+                self.say(state="connecting", attempt=attempt)
+                if self.stopping():
+                    break
+                proc = spawn_ffmpeg(url_file, w, h)
+
+                latest = [None]
+                got_frame = threading.Event()
+                errors = deque(maxlen=5)
+                rt = threading.Thread(target=read_frames, args=(proc, size, latest, got_frame), daemon=True)
+                et = threading.Thread(target=read_errors, args=(proc, errors), daemon=True)
+                rt.start()
+                et.start()
+
+                last = time.monotonic()
+                live = False
+                stats_at = last + STATS_S
+                while not self.stopping():
+                    if got_frame.wait(0.25):
+                        got_frame.clear()
+                        self.sink(latest[0])
+                        last = time.monotonic()
+                        if not live:
+                            live = True
+                            attempt = 0
+                            try:
+                                os.unlink(url_file)   # ffmpeg has it open; the password leaves the disk
+                            except FileNotFoundError:
+                                pass
+                            self.say(state="live")
+                    if proc.poll() is not None:
+                        break
+                    now = time.monotonic()
+                    limit = STALL_S if live else CONNECT_S
+                    if now - last > limit:
+                        errors.append(f"no frame for {limit:.0f}s")
+                        break
+                    if live and (now >= stats_at or self.stats_due):
+                        stats_at = now + STATS_S
+                        self.stats_due = False
+                        self.say(stats={"boxes": "off", "objects": 0, "box_age_ms": None, "size": f"{w}x{h}",
+                                        "note": "PyAV not installed (pip3 install av); boxes off"})
+                proc.kill()
+                proc.wait()
+                rt.join(2)        # its pipe closed with the process; never let it read the next one's bytes
+                et.join(2)
+                self.clear_ready()
+                if self.stopping():
+                    break
+                delay = BACKOFF[min(attempt, len(BACKOFF) - 1)]
+                attempt += 1
+                self.say(state="reconnecting", attempt=attempt, delay=delay, error=redact("; ".join(errors)))
+                pause(delay, self.stopping)
+        finally:
+            if proc is not None and proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            try:
+                os.unlink(url_file)
+            except FileNotFoundError:
+                pass
 
 
-# ---------------------------------------------------------------- boxes path (--boxes live|aligned)
+# ---------------------------------------------------------------- RTSP + PyAV path
 
 NTP_EPOCH = 2208988800
 START = b"\x00\x00\x00\x01"
@@ -314,8 +503,9 @@ class Rtsp:
     HEAD_MAX = 64 * 1024
     BODY_MAX = 1024 * 1024
 
-    def __init__(self, host, user, pw):
+    def __init__(self, host, user, pw, stopping):
         self.user, self.pw = user, pw
+        self.stopping = stopping
         self.sock = socket.create_connection((host, 554), timeout=TCP_CONNECT_S)
         self.sock.settimeout(0.25)   # every blocking read wakes often enough to honour stop (SIGTERM only flips a flag)
         self.buf = b""
@@ -334,7 +524,7 @@ class Rtsp:
 
     def _recv(self, deadline):
         while True:
-            if stopping():
+            if self.stopping():
                 raise RtspError("stopping")
             if time.monotonic() > deadline:
                 raise socket.timeout("read deadline")
@@ -697,6 +887,8 @@ class Boxes:
     def for_frame(self, cap, mono):
         """(boxes, age_ms, held) for a frame with capture time `cap` published at `mono`.
         age_ms = how far the boxes trail the frame in camera time (frame capture − document time)."""
+        if self.mode == "off":
+            return [], None, False
         if self.mode == "live":
             fresh = [(utc, objs) for utc, objs, arr in self.latest.values() if (mono - arr) * 1000 <= LIVE_MAX_AGE * self.interval_ms]
             if not fresh:
@@ -731,187 +923,276 @@ IDENTITY = "1.000000,0.000000,0.000000;0.000000,1.000000,0.000000;0.000000,0.000
 META_MAX = 1024 * 1024
 
 
-def run_boxes(a, cam, pub, w, h, av):
-    host = urlsplit(cam["base"]).hostname
-    size = w * h * 3
-    attempt = 0
-    while not stopping():
-        pw = password(cam)
-        if stopping():
-            break
-        emit(tile=a.tile, state="connecting", camera=a.camera, attempt=attempt)
-        errors = deque(maxlen=5)
-        rtsp = None
-        live = False
-        try:
-            rtsp = Rtsp(host, cam["user"], pw)
-            del pw
-            url = f"rtsp://{host}/axis-media/media.amp?camera=1&videocodec=h264&resolution={w}x{h}&fps={a.fps}&audio=0&analytics=polygon&onvifreplayext=1"
-            head, sdp = rtsp.request("DESCRIBE", url, ["Accept: application/sdp"])
-            cb = re.search(r"^content-base:\s*(\S+)", head, re.I | re.M)
-            tracks = dict(sdp_tracks(sdp, cb.group(1) if cb else url))
-            if "video" not in tracks:
-                raise RtspError("no video track in the SDP")
-            transform = re.search(r"^a=transform:(\S+)", sdp, re.M)
-            boxes_ok = transform is None or transform.group(1) == IDENTITY
-            if not boxes_ok:
-                errors.append("non-identity a=transform in the SDP; boxes off")
-            m = re.search(r"sprop-parameter-sets=([^;\s]+)", sdp)
+class RtspStream(Stream):
+    def __init__(self, *args, av):
+        super().__init__(*args)
+        self.av = av
+        self.skip_meta = False   # a metadata SETUP the camera refused: the next connection runs video-only
+
+    def body(self):
+        a, cam, w, h, av = self.a, self.cam, self.w, self.h, self.av
+        host = urlsplit(cam["base"]).hostname
+        size = w * h * 3
+        attempt = 0
+        while not self.stopping():
+            self.clear_ready()
+            pw = password(cam, self.stopping)
+            if self.stopping():
+                break
+            self.say(state="connecting", attempt=attempt)
+            errors = deque(maxlen=5)
+            rtsp = None
+            live = False
             try:
-                sps_pps = b"".join(START + base64.b64decode(x) for x in m.group(1).split(",")) if m else b""
-            except ValueError:
-                sps_pps = b""
-            vch, mch = 0, 2
-            rtsp.setup(tracks["video"], vch)
-            if "application" in tracks:
-                rtsp.setup(tracks["application"], mch)
-            else:
-                boxes_ok = False
-                errors.append("no metadata track; boxes off")
-            rtsp.play(url)
-
-            ctx = av.CodecContext.create("h264", "r")
-            ctx.flags |= av.codec.context.Flags.low_delay
-            ctx.thread_type = "SLICE"
-            depack = H264Depacketizer(sps_pps)
-            meta = bytearray()
-            boxes = Boxes(a.boxes)
-            hold = deque()                      # aligned: (rgb bytearray, cap, arrival_mono)
-            rect = None
-            last = time.monotonic()
-            stats_at = last + STATS_S
-            objects = age = 0
-            bad = 0
-
-            def publish(rgb, cap, arrival):
-                nonlocal objects, age
-                objs, age_ms, _ = (boxes.for_frame(cap, time.monotonic()) if boxes_ok else ([], None, False))
-                if objs:
-                    burn(rgb, w, h, rect[:4], objs)
-                objects, age = len(objs), age_ms
-                pub.publish(rgb)
-
-            while not stopping():
+                rtsp = Rtsp(host, cam["user"], pw, self.stopping)
+                del pw
+                url = f"rtsp://{host}/axis-media/media.amp?camera=1&videocodec=h264&resolution={w}x{h}&fps={a.fps}&audio=0&analytics=polygon&onvifreplayext=1"
+                head, sdp = rtsp.request("DESCRIBE", url, ["Accept: application/sdp"])
+                cb = re.search(r"^content-base:\s*(\S+)", head, re.I | re.M)
+                tracks = dict(sdp_tracks(sdp, cb.group(1) if cb else url))
+                if "video" not in tracks:
+                    raise RtspError("no video track in the SDP")
+                transform = re.search(r"^a=transform:(\S+)", sdp, re.M)
+                boxes_ok = transform is None or transform.group(1) == IDENTITY
+                note = None
+                if not boxes_ok:
+                    note = "non-identity a=transform in the SDP; boxes off"
+                m = re.search(r"sprop-parameter-sets=([^;\s]+)", sdp)
                 try:
-                    item = rtsp.read(0.25)
-                except socket.timeout:
-                    item = None
-                now = time.monotonic()
-                if item is not None and item[0] == "rtsp":
-                    rtsp.answered(item[1])
-                elif item is not None:
-                    _, ch, pkt = item
+                    sps_pps = b"".join(START + base64.b64decode(x) for x in m.group(1).split(",")) if m else b""
+                except ValueError:
+                    sps_pps = b""
+                vch, mch = 0, 2
+                rtsp.setup(tracks["video"], vch)
+                skip_meta, self.skip_meta = self.skip_meta, False   # one-shot: the attempt after a failed metadata SETUP runs video-only
+                if skip_meta:
+                    boxes_ok = False
+                    note = "metadata SETUP failed last time; boxes off"
+                elif "application" in tracks:
                     try:
-                        if ch == vch:
-                            r = depack.feed(pkt)
-                        elif ch == mch:
-                            r = None
-                            m_, _, p, end, _ = rtp_header(pkt)
-                            meta += pkt[p:end]
-                            if len(meta) > META_MAX:
-                                meta.clear()
-                            elif m_:
-                                boxes.add(bytes(meta), now)
-                                meta.clear()
-                        else:
-                            r = None               # RTCP
-                    except (ValueError, struct.error, IndexError):
-                        bad += 1                   # one malformed packet: drop it, keep the stream
-                        r = None
-                        if ch == vch:
-                            depack = H264Depacketizer(sps_pps)
-                    if r is not None:
-                        au, cap = r
-                        boxes.frame_seen(cap, now)
-                        pkt_ = av.Packet(au)
-                        pkt_.pts = pkt_.dts = cap if cap is not None else 0
-                        try:
-                            frames = ctx.decode(pkt_)
-                        except av.error.InvalidDataError:
-                            frames = []
-                        for f in frames:
-                            if rect is None or (f.width, f.height) != rect[4:]:
-                                rect = content_rect(f.width, f.height, w, h) + (f.width, f.height)
-                            ox, oy, cw, ch_ = rect[:4]
-                            pic = f.reformat(width=cw, height=ch_, format="rgb24")
-                            plane = pic.planes[0]
-                            if cw == w and ch_ == h and plane.line_size == w * 3:
-                                rgb = bytearray(plane)
-                            else:
-                                rgb = bytearray(size)
-                                src = bytes(plane)
-                                ls = plane.line_size
-                                for y in range(ch_):
-                                    o = ((oy + y) * w + ox) * 3
-                                    rgb[o:o + cw * 3] = src[y * ls:y * ls + cw * 3]
-                            last = now
-                            if not live:
-                                live = True
-                                attempt = 0
-                                emit(tile=a.tile, state="live", camera=a.camera)
-                            if a.boxes == "aligned" and boxes_ok:
-                                hold.append((rgb, f.pts if cap is not None else None, now))
-                                while len(hold) > 2 * a.fps:   # a hold past 2 s means the terminal or decoder is behind: drop the oldest
-                                    hold.popleft()
-                            else:
-                                publish(rgb, cap, now)
-                while hold and now >= hold[0][2] + boxes.hold_s():
-                    rgb, cap, arrival = hold.popleft()
-                    publish(rgb, cap, arrival)       # Publisher drops what the terminal has not read
-                limit = STALL_S if live else CONNECT_S
-                if now - last > limit:
-                    errors.append(f"no frame for {limit:.0f}s")
-                    break
-                rtsp.keepalive(url)
-                if now >= stats_at:
-                    stats_at = now + STATS_S
-                    emit(tile=a.tile, stats={"boxes": a.boxes if boxes_ok else "off", "objects": objects, "box_age_ms": age,
-                                             "held": boxes.held, "matched": boxes.matched, "unmatched": boxes.unmatched, "bad_packets": bad,
-                                             "meta_lag_ms": int(max(l for _, l in boxes.lags) * 1000) if boxes.lags else None,
-                                             "hold_ms": int(boxes.hold_s() * 1000) if a.boxes == "aligned" else 0})
-        except Exception as e:   # RTSP, socket, decoder or a bug: the tile reconnects rather than dies
-            errors.append(redact(f"{type(e).__name__}: {e}"))
-        finally:
-            if rtsp is not None:
-                rtsp.close()
-        if stopping():
-            break
-        delay = BACKOFF[min(attempt, len(BACKOFF) - 1)]
-        attempt += 1
-        emit(tile=a.tile, state="reconnecting", camera=a.camera, attempt=attempt, delay=delay,
-             error=redact("; ".join(errors)))
-        pause(delay)
+                        rtsp.setup(tracks["application"], mch)
+                    except (RtspError, OSError) as e:   # refused, or timed out: either way the video must not wait on it
+                        self.skip_meta = True
+                        raise RtspError(f"metadata SETUP {type(e).__name__}: {e}; retrying video-only") from None
+                else:
+                    boxes_ok = False
+                    note = "no metadata track; boxes off"
+                if note:
+                    errors.append(note)
+                rtsp.play(url)
 
+                ctx = av.CodecContext.create("h264", "r")
+                ctx.flags |= av.codec.context.Flags.low_delay
+                ctx.thread_type = "SLICE"
+                depack = H264Depacketizer(sps_pps)
+                meta = bytearray()
+                mode = self.want.v[0]
+                boxes = Boxes(mode)
+                hold = deque()                      # aligned: (rgb bytearray, cap, arrival_mono)
+                rect = None
+                last = time.monotonic()
+                stats_at = last + STATS_S
+                objects = age = 0
+                bad = 0
+
+                def publish(rgb, cap):
+                    nonlocal objects, age
+                    objs, age_ms, _ = (boxes.for_frame(cap, time.monotonic()) if boxes_ok else ([], None, False))
+                    if objs:
+                        burn(rgb, w, h, rect[:4], objs)
+                    objects, age = len(objs), age_ms
+                    self.sink(rgb)
+
+                while not self.stopping():
+                    want_mode = self.want.v[0]
+                    if want_mode != mode:
+                        if mode == "aligned":
+                            hold.clear()            # aligned → live/off: the picture jumps forward by the hold time
+                        mode = boxes.mode = want_mode   # live → aligned: the picture pauses while the hold fills
+                        if mode == "off":
+                            objects, age = 0, None
+                        self.stats_due = True
+                    try:
+                        item = rtsp.read(0.25)
+                    except socket.timeout:
+                        item = None
+                    now = time.monotonic()
+                    if item is not None and item[0] == "rtsp":
+                        rtsp.answered(item[1])
+                    elif item is not None:
+                        _, ch, pkt = item
+                        try:
+                            if ch == vch:
+                                r = depack.feed(pkt)
+                            elif ch == mch:
+                                r = None
+                                m_, _, p, end, _ = rtp_header(pkt)
+                                meta += pkt[p:end]
+                                if len(meta) > META_MAX:
+                                    meta.clear()
+                                elif m_:
+                                    boxes.add(bytes(meta), now)   # fed in every mode, so a flip to live or aligned has boxes at once
+                                    meta.clear()
+                            else:
+                                r = None               # RTCP
+                        except (ValueError, struct.error, IndexError):
+                            bad += 1                   # one malformed packet: drop it, keep the stream
+                            r = None
+                            if ch == vch:
+                                depack = H264Depacketizer(sps_pps)
+                        if r is not None:
+                            au, cap = r
+                            boxes.frame_seen(cap, now)
+                            pkt_ = av.Packet(au)
+                            pkt_.pts = pkt_.dts = cap if cap is not None else 0
+                            try:
+                                frames = ctx.decode(pkt_)
+                            except av.error.InvalidDataError:
+                                frames = []
+                            for f in frames:
+                                if rect is None or (f.width, f.height) != rect[4:]:
+                                    rect = content_rect(f.width, f.height, w, h) + (f.width, f.height)
+                                ox, oy, cw, ch_ = rect[:4]
+                                pic = f.reformat(width=cw, height=ch_, format="rgb24")
+                                plane = pic.planes[0]
+                                if cw == w and ch_ == h and plane.line_size == w * 3:
+                                    rgb = bytearray(plane)
+                                else:
+                                    rgb = bytearray(size)
+                                    src = bytes(plane)
+                                    ls = plane.line_size
+                                    for y in range(ch_):
+                                        o = ((oy + y) * w + ox) * 3
+                                        rgb[o:o + cw * 3] = src[y * ls:y * ls + cw * 3]
+                                last = now
+                                if not live:
+                                    live = True
+                                    attempt = 0
+                                    self.say(state="live")
+                                if mode == "aligned" and boxes_ok:
+                                    hold.append((rgb, f.pts if cap is not None else None, now))
+                                    while len(hold) > 2 * a.fps:   # a hold past 2 s means the terminal or decoder is behind: drop the oldest
+                                        hold.popleft()
+                                else:
+                                    publish(rgb, cap)
+                    while hold and now >= hold[0][2] + boxes.hold_s():
+                        rgb, cap, _ = hold.popleft()
+                        publish(rgb, cap)       # Publisher drops what the terminal has not read
+                    limit = STALL_S if live else CONNECT_S
+                    if now - last > limit:
+                        errors.append(f"no frame for {limit:.0f}s")
+                        break
+                    rtsp.keepalive(url)
+                    if live and (now >= stats_at or self.stats_due):
+                        stats_at = now + STATS_S
+                        self.stats_due = False
+                        self.say(stats={"boxes": mode if boxes_ok else "off", "objects": objects, "box_age_ms": age,
+                                        "held": boxes.held, "matched": boxes.matched, "unmatched": boxes.unmatched, "bad_packets": bad,
+                                        "meta_lag_ms": int(max(l for _, l in boxes.lags) * 1000) if boxes.lags else None,
+                                        "hold_ms": int(boxes.hold_s() * 1000) if mode == "aligned" and boxes_ok else 0,
+                                        "size": f"{rect[4]}x{rect[5]}" if rect else None,
+                                        **({"note": note} if note else {})})
+            except Exception as e:   # RTSP, socket, decoder or a bug: the tile reconnects rather than dies
+                errors.append(redact(f"{type(e).__name__}: {e}"))
+            finally:
+                if rtsp is not None:
+                    rtsp.close()
+                self.clear_ready()
+            if self.stopping():
+                break
+            delay = BACKOFF[min(attempt, len(BACKOFF) - 1)]
+            attempt += 1
+            self.say(state="reconnecting", attempt=attempt, delay=delay, error=redact("; ".join(errors)))
+            pause(delay, self.stopping)
+
+
+# ---------------------------------------------------------------- main: control file + swaps
 
 def main():
+    global CTL
     ap = argparse.ArgumentParser()
     ap.add_argument("--camera", required=True)
     ap.add_argument("--tile", type=int, default=0)
     ap.add_argument("--size", default="640x360")
     ap.add_argument("--fps", type=int, default=15)
-    ap.add_argument("--boxes", choices=("live", "aligned", "off"), default="off")
+    ap.add_argument("--boxes", choices=MODES, default="off")
     a = ap.parse_args()
     w, h = (int(x) for x in a.size.lower().split("x"))
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))   # the password lives in this process: never in a core file
-    with open(REGISTRY) as f:
-        cam = json.load(f)[a.camera]
-    pub = Publisher(a.tile, w, h)
+    tmp = tempfile.mkdtemp(prefix="campub-")           # 0700 under the per-user TMPDIR; names never come from the registry
+    CTL = os.path.join(tmp, "ctl.json")
+    os.close(os.open(CTL, os.O_WRONLY | os.O_CREAT, 0o600))
+    want = Want((a.boxes, w, h))
+    pub = Publisher(a.tile)
+    threads = []
     try:
-        av = None
-        if a.boxes != "off":
-            try:
-                import av
-            except ImportError:
-                emit(tile=a.tile, stats={"boxes": "off", "note": "PyAV not installed (pip3 install av); boxes off"})
-        if av is not None:
-            run_boxes(a, cam, pub, w, h, av)
-        else:
-            run_ffmpeg(a, cam, pub, w, h)
-    except Exception as e:  # cred failure, bad registry entry, ffmpeg missing: say so, then clean up
-        emit(tile=a.tile, state="error", camera=a.camera, error=redact(f"{type(e).__name__}: {e}"))
+        with open(REGISTRY) as f:
+            cam = json.load(f)[a.camera]
+        try:
+            import av
+        except ImportError:
+            av = None
+            emit(tile=a.tile, camera=a.camera, ctl=CTL, stats={"boxes": "off", "note": "PyAV not installed (pip3 install av); boxes off"})
+
+        def make(sw, sh):
+            t = RtspStream(a, cam, want, pub, sw, sh, tmp, av=av) if av is not None else FfmpegStream(a, cam, want, pub, sw, sh, tmp)
+            threads.append(t)
+            return t
+
+        owner = make(w, h)
+        pub.owner = owner       # before start(): its first "connecting" must be a state line, not a swap line
+        owner.start()
+        control = Control(CTL, want)
+        pending = None
+        failed_size = None      # a size the camera would not serve: not tried again until the request changes
+        last_want = want.v[1:]
+        while not stopping():
+            control.poll()
+            want_size = want.v[1:]
+            if want_size != last_want:
+                last_want = want_size
+                failed_size = None
+            if pending is not None and pending.size != want_size:
+                pending.stop()      # the request moved on before this one was ready
+                emit(tile=a.tile, swap={"size": "%dx%d" % pending.size, "state": "cancelled"})
+                pending = None
+            if pending is None and want_size != owner.size and want_size != failed_size:
+                pending = make(*want_size)
+                pending.start()
+                emit(tile=a.tile, swap={"size": "%dx%d" % want_size, "state": "starting"})
+            if pending is not None and pending.done:
+                emit(tile=a.tile, swap={"size": "%dx%d" % pending.size, "state": "error", "error": pending.error})
+                failed_size = pending.size
+                pending = None
+            elif pending is not None and pending.ready is not None and pub.promote(pending):
+                # promote() moved ownership under the lock; False means the frame vanished first (disconnect) and the newcomer waits on
+                emit(tile=a.tile, swap={"size": "%dx%d" % pending.size, "state": "done"})
+                owner.stop()
+                owner = pending
+                pending = None
+                owner.say(state="live")
+                owner.stats_due = True
+            if owner.done:
+                if owner.error:
+                    emit(tile=a.tile, camera=a.camera, ctl=CTL, state="error", error=owner.error)
+                break
+            threads[:] = [t for t in threads if t.is_alive() or t is owner or t is pending]
+            time.sleep(TICK_S)
+    except Exception as e:  # bad registry entry, unreadable registry: say so, then clean up
+        emit(tile=a.tile, camera=a.camera, ctl=CTL, state="error", error=redact(f"{type(e).__name__}: {e}"))
     finally:
+        for t in threads:
+            t.stop()
+        for t in threads:
+            t.join(2 * TICK_S + TCP_CONNECT_S)   # a stream wakes every 0.25 s; a connect attempt within 3 s; daemon threads die with us past that
         pub.cleanup()
-        emit(tile=a.tile, state="stopped", camera=a.camera)
+        try:
+            for name in os.listdir(tmp):
+                os.unlink(os.path.join(tmp, name))
+            os.rmdir(tmp)
+        except OSError:
+            pass   # a thread still in password() past the join bound may touch the dir; the OS reaps the rest
+        emit(tile=a.tile, camera=a.camera, state="stopped")
 
 
 if __name__ == "__main__":

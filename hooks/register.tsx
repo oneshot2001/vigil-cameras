@@ -1,13 +1,15 @@
 import type { Register } from 'claude-code'
 
-// vigil-cameras v0.3.1: a grid of live camera tiles in a pane, with ONVIF analytics boxes.
+// vigil-cameras v0.4.0: a grid of live camera tiles in a pane, with ONVIF analytics boxes.
 // /cam                 every camera in the registry
 // /cam <id> [<id>…]    just those (one id = single tile at 1280×720)
 // /cam add <id>…       /cam rm <id>…
-// /cam boxes [<id>…] live|aligned|off   boxes mode for those tiles (default: every tile); they restart
+// /cam boxes [<id>…] live|aligned|off   boxes mode for those tiles (default: every tile)
 // /cam off             stop every stream and close the pane
 // Frames: one libexec/campub.py per tile (RTSP → PyAV decode → boxes burned in → fresh POSIX shm per
-// frame; ffmpeg instead when boxes are off) → $.ui.blit.
+// frame; ffmpeg when PyAV is missing) → $.ui.blit. A boxes or size change goes to the publisher's
+// control file (its path rides on every state/stats line); the publisher applies it on the running
+// stream, or opens the new size beside the old one and hands over once it has a frame. No restarts.
 
 const PANE = 'cameras'
 const CELL_ASPECT = 2.14 // cell height ÷ cell width; no API reports it (mobile-mcp hardcodes the same)
@@ -27,6 +29,8 @@ type Tile = {
   stats?: { boxes: string; objects?: number; box_age_ms?: number | null; note?: string } // the publisher's once-a-second report
   child?: AsyncGenerator<any, any> // the live spawn stream; return() kills the publisher
   running?: Promise<void>          // settles when the stream loop has wound down
+  ctl?: string                     // the publisher's control file, once it has announced it
+  ctlQueue: Promise<void>          // control writes run one after another, each with the fields as they stand when it runs
   stop: boolean
   blits: number
   denied: number
@@ -111,7 +115,25 @@ function status($: any, force = false) {
   $.ui.status(tiles.map(t => `${t.camera} ${t.state === 'live' ? t.fps : t.state}`).join(' · '))
 }
 
+// Write the tile's whole desired state to its publisher's control file. Writes queue per tile and
+// read the fields when they run, so the announce-triggered write can never overtake a later command.
+function control($: any, t: Tile) {
+  const run = async () => {
+    if (!t.ctl || !t.running) return
+    const body = JSON.stringify({ boxes: t.boxes, size: `${t.width}x${t.height}` })
+    try {
+      await $.fs.write(t.ctl, body)
+    } catch (err) {
+      $.ui.log(`cameras ${t.camera}: control write failed, retrying once: ${String(err)}`, { to: 'debug' })
+      try { await $.fs.write(t.ctl, body) } catch (err2) { $.ui.log(`cameras ${t.camera}: control write failed: ${String(err2)}`, { to: 'debug' }) }
+    }
+  }
+  t.ctlQueue = t.ctlQueue.then(run, run)
+  return t.ctlQueue
+}
+
 async function stream($: any, t: Tile) {
+  t.ctl = undefined // a new publisher announces its own file
   const proc = $.process.spawn({
     argv: [
       'python3',
@@ -138,6 +160,10 @@ async function stream($: any, t: Tile) {
         buf = buf.slice(nl + 1)
         let msg: any
         try { msg = JSON.parse(line) } catch { continue }
+        if (typeof msg.ctl === 'string' && msg.ctl !== t.ctl) {
+          t.ctl = msg.ctl
+          void control($, t) // the state as it stands now, in case a command landed before the announcement
+        }
         if (msg.shm) {
           const r = await $.ui.blit({
             requestId: PANE,
@@ -156,6 +182,8 @@ async function stream($: any, t: Tile) {
           if (msg.stats.note && msg.stats.note !== t.stats?.note) $.ui.log(`campub ${t.camera}: ${msg.stats.note}`, { to: 'debug' })
           t.stats = msg.stats
           $.ui.invalidate('ui.render')
+        } else if (msg.swap) {
+          $.ui.log(`campub ${t.camera}: swap to ${msg.swap.size}: ${msg.swap.state}${msg.swap.error ? ` (${msg.swap.error})` : ''}`, { to: 'debug' })
         }
       }
     }
@@ -164,6 +192,7 @@ async function stream($: any, t: Tile) {
   } finally {
     if (t.child === proc) t.child = undefined
     t.running = undefined
+    t.ctl = undefined
     t.state = 'off'
     $.ui.invalidate('ui.render')
     status($, true)
@@ -183,22 +212,28 @@ async function stopTile(t: Tile) {
   }
 }
 
-// Make the running tiles match `cameras`: stop what left or changed size, start what is missing.
+// Make the running tiles match `cameras`: stop what left, start what is missing, and tell a stayer
+// whose size changed; its publisher swaps streams itself, so it never stops drawing.
 async function apply($: any, cameras: string[]) {
   const [w, h] = sizeFor(cameras.length)
-  const keep = tiles.filter(t => cameras.includes(t.camera) && t.width === w && t.height === h)
+  const keep = tiles.filter(t => cameras.includes(t.camera))
   const leaving = tiles.filter(t => !keep.includes(t))
   tiles = cameras.map(
     c =>
       keep.find(t => t.camera === c) ?? {
-        camera: c, width: w, height: h, state: 'starting', stop: false, blits: 0, denied: 0, fps: '0 fps',
-        boxes: leaving.find(t => t.camera === c)?.boxes ?? defaultMode, // a tile recreated at the other size keeps its mode
+        camera: c, width: w, height: h, state: 'starting', boxes: defaultMode, ctlQueue: Promise.resolve(),
+        stop: false, blits: 0, denied: 0, fps: '0 fps',
       },
   )
   since = Date.now() // a fresh sampling window: an idle span before this would read as a low rate
   $.ui.invalidate('ui.render')
   await Promise.all(leaving.map(stopTile))
   for (const t of tiles) {
+    if (t.width !== w || t.height !== h) {
+      t.width = w
+      t.height = h
+      void control($, t)
+    }
     if (!t.running) {
       t.stop = false
       t.running = stream($, t).catch(() => undefined)
@@ -206,16 +241,18 @@ async function apply($: any, cameras: string[]) {
   }
 }
 
-// Restart the given tiles with a new boxes mode; the others keep streaming.
-async function setMode($: any, which: Tile[], mode: Mode) {
-  for (const t of which) t.boxes = mode
-  await Promise.all(which.map(stopTile))
-  since = Date.now()
+// Give the given tiles a new boxes mode on their running streams; a dead tile is started again.
+function setMode($: any, which: Tile[], mode: Mode) {
   for (const t of which) {
-    t.stop = false
-    t.state = 'starting'
-    t.stats = undefined
-    t.running = stream($, t).catch(() => undefined)
+    t.boxes = mode
+    if (t.running) {
+      void control($, t)
+    } else {
+      t.stop = false
+      t.state = 'starting'
+      t.stats = undefined
+      t.running = stream($, t).catch(() => undefined)
+    }
   }
   $.ui.invalidate('ui.render')
 }
