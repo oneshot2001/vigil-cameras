@@ -1,10 +1,11 @@
 import type { Register } from 'claude-code'
 
-// vigil-cameras v0.4.0: a grid of live camera tiles in a pane, with ONVIF analytics boxes.
+// vigil-cameras v0.5.0: a grid of live camera tiles in a pane, with ONVIF analytics boxes.
 // /cam                 every camera in the registry
 // /cam <id> [<id>…]    just those (one id = single tile at 1280×720)
 // /cam add <id>…       /cam rm <id>…
 // /cam boxes [<id>…] live|aligned|off   boxes mode for those tiles (default: every tile)
+// /cam watch <id> person|vehicle [l,t,r,b] | off   flag the tile when the camera's analytics see one arrive
 // /cam off             stop every stream and close the pane
 // Frames: one libexec/campub.py per tile (RTSP → PyAV decode → boxes burned in → fresh POSIX shm per
 // frame; ffmpeg when PyAV is missing) → $.ui.blit. A boxes or size change goes to the publisher's
@@ -19,6 +20,12 @@ const GRID = [640, 360] as const
 const MODES = ['live', 'aligned', 'off'] as const
 type Mode = (typeof MODES)[number]
 let defaultMode: Mode = 'live' // `/cam boxes <mode>` with no ids also sets the mode new tiles start in
+const CLASSES: Record<string, string> = { person: 'Human', vehicle: 'Vehicle' } // the Axis analytics class names
+const WORDS: Record<string, string> = { Human: 'person', Vehicle: 'vehicle' }
+let watchRev = 0 // every watch change gets a new rev; lines carrying an older one are ignored
+
+type Wake = { cls: string; rev: number; n: number; k: number; utc_ms: number } // k: wakes under this rev, from 1
+type WatchStats = { state: string; cls: string; rev: number; wakes: number; last: Wake | null }
 
 type Tile = {
   camera: string
@@ -26,7 +33,9 @@ type Tile = {
   height: number
   state: string
   boxes: Mode
-  stats?: { boxes: string; objects?: number; box_age_ms?: number | null; note?: string } // the publisher's once-a-second report
+  stats?: { boxes: string; objects?: number; box_age_ms?: number | null; note?: string; watch?: WatchStats | null } // the publisher's once-a-second report
+  watch?: { cls: string; rect?: number[]; rev: number }
+  wake?: Wake // newest wake of this publisher under the current rev (from a wake line or, if the pipe dropped it, stats)
   child?: AsyncGenerator<any, any> // the live spawn stream; return() kills the publisher
   running?: Promise<void>          // settles when the stream loop has wound down
   ctl?: string                     // the publisher's control file, once it has announced it
@@ -67,10 +76,37 @@ function fit(bodyColumns: number, bodyRows: number | undefined, n: number, w: nu
   return { columns, rows, cols: g.cols }
 }
 
-// "q6325 · live · boxes aligned · 3 obj · 0.5 s" — the publisher reports the mode it actually runs
-// (off when PyAV is missing or the camera has no metadata track).
-function header(t: Tile, columns: number) {
+// One toast per new wake, whether it came as its own line or, when the publisher's stdout dropped that
+// line, as stats.watch.last on the next stats line. Wakes the pipe lost entirely are counted, not toasted.
+function noteWake($: any, t: Tile, w: Wake | null | undefined) {
+  if (!t.watch || !w || w.rev !== t.watch.rev || (t.wake && w.k <= t.wake.k)) return
+  const missed = w.k - (t.wake?.k ?? 0) - 1
+  t.wake = w
+  $.ui.toast(`${t.camera}: ${WORDS[w.cls] ?? w.cls} ${new Date(w.utc_ms).toTimeString().slice(0, 8)}${missed > 0 ? ` (+${missed} more)` : ''}`)
+  $.ui.invalidate('ui.render')
+}
+
+// The watch part as the publisher reports it: "watching vehicle", "● vehicle 14:02:11", "watch waiting".
+function watchPart(t: Tile): { text: string; alert: boolean } | undefined {
+  if (!t.watch) return undefined
+  const word = WORDS[t.watch.cls] ?? t.watch.cls
+  const w = t.stats?.watch
+  if (!w || w.rev !== t.watch.rev) return { text: `watch ${word} pending`, alert: false } // not acknowledged yet
+  if (w.state !== 'on') return { text: `watch ${w.state}`, alert: false }
+  const last = [t.wake, w.last].filter((x): x is Wake => !!x && x.rev === t.watch!.rev).sort((a, b) => b.k - a.k)[0]
+  if (!last) return { text: `watching ${word}`, alert: false }
+  return { text: `● ${word} ${new Date(last.utc_ms).toTimeString().slice(0, 8)}`, alert: true }
+}
+
+// "q6325 · live · ● vehicle 14:02:11 · boxes aligned · 3 obj · 0.5 s" — the publisher reports what it
+// actually runs (boxes off when PyAV is missing or the camera has no metadata track). The watch part
+// comes right after the state so a narrow tile drops box details first. Returns the line in three runs
+// so the watch part can carry its own colour.
+function header(t: Tile, columns: number): [string, string, string, boolean] {
+  const watch = watchPart(t)
   const parts = [t.camera, t.state]
+  if (watch) parts.push(watch.text)
+  const fixed = parts.length // never dropped
   const s = t.stats
   if (t.state === 'live' && t.boxes !== 'off') {
     parts.push(`boxes ${s?.boxes ?? t.boxes}`)
@@ -82,11 +118,16 @@ function header(t: Tile, columns: number) {
   // Narrow tile: drop whole parts from the end (age, count, boxes) rather than cut a number in half or
   // leave "live · live" (the word "boxes" is what gives the second "live" its meaning).
   let line = parts.join(' · ')
-  while (line.length > columns && parts.length > 2) {
+  while (line.length > columns && parts.length > fixed) {
     parts.pop()
     line = parts.join(' · ')
   }
-  return line.slice(0, columns)
+  if (!watch) return [line.slice(0, columns), '', '', false]
+  const pre = `${t.camera} · ${t.state} · `
+  let mid = watch.text
+  if (watch.alert && pre.length + mid.length > columns) mid = mid.slice(0, -3) // narrow tile: hh:mm rather than a cut-off hh:mm:
+  line = [pre + mid, ...parts.slice(fixed)].join(' · ')
+  return [pre.slice(0, columns), mid.slice(0, Math.max(0, columns - pre.length)), line.slice(pre.length + mid.length, Math.max(0, columns)), watch.alert]
 }
 
 async function registry($: any): Promise<string[]> {
@@ -120,7 +161,7 @@ function status($: any, force = false) {
 function control($: any, t: Tile) {
   const run = async () => {
     if (!t.ctl || !t.running) return
-    const body = JSON.stringify({ boxes: t.boxes, size: `${t.width}x${t.height}` })
+    const body = JSON.stringify({ boxes: t.boxes, size: `${t.width}x${t.height}`, watch: t.watch ?? null })
     try {
       await $.fs.write(t.ctl, body)
     } catch (err) {
@@ -134,6 +175,8 @@ function control($: any, t: Tile) {
 
 async function stream($: any, t: Tile) {
   t.ctl = undefined // a new publisher announces its own file
+  t.stats = undefined // and counts its own wakes from 1: nothing of the last one's may outrank them
+  t.wake = undefined
   const proc = $.process.spawn({
     argv: [
       'python3',
@@ -156,6 +199,7 @@ async function stream($: any, t: Tile) {
       buf += chunk.text
       let nl: number
       while ((nl = buf.indexOf('\n')) >= 0) {
+        if (t.stop) break // stopped during an awaited blit: the rest of this chunk is the old publisher's
         const line = buf.slice(0, nl)
         buf = buf.slice(nl + 1)
         let msg: any
@@ -181,7 +225,10 @@ async function stream($: any, t: Tile) {
         } else if (msg.stats) {
           if (msg.stats.note && msg.stats.note !== t.stats?.note) $.ui.log(`campub ${t.camera}: ${msg.stats.note}`, { to: 'debug' })
           t.stats = msg.stats
+          noteWake($, t, msg.stats.watch?.last)
           $.ui.invalidate('ui.render')
+        } else if (msg.wake) {
+          noteWake($, t, msg.wake)
         } else if (msg.swap) {
           $.ui.log(`campub ${t.camera}: swap to ${msg.swap.size}: ${msg.swap.state}${msg.swap.error ? ` (${msg.swap.error})` : ''}`, { to: 'debug' })
         }
@@ -272,8 +319,8 @@ export const register: Register = on => {
     if ((await $.ui.panes()).some((p: { id: string }) => p.id === PANE)) await $.ui.close({ id: PANE })
     await $.command.register({
       name: 'cam',
-      description: 'Live camera pane: /cam, /cam <id>…, /cam add|rm <id>…, /cam boxes [<id>…] live|aligned|off, /cam off',
-      argumentHint: '[<id>… | add <id>… | rm <id>… | boxes [<id>…] live|aligned|off | off]',
+      description: 'Live camera pane: /cam, /cam <id>…, /cam add|rm <id>…, /cam boxes [<id>…] live|aligned|off, /cam watch <id> person|vehicle [l,t,r,b] | off, /cam off',
+      argumentHint: '[<id>… | add <id>… | rm <id>… | boxes [<id>…] live|aligned|off | watch <id> person|vehicle [l,t,r,b] | watch <id> off | off]',
     })
     return next(e)
   })
@@ -299,6 +346,36 @@ export const register: Register = on => {
         if (!ids.length) defaultMode = mode
         await setMode($, which, mode)
         return { text: which.length ? `Boxes ${mode} on ${which.map(t => t.camera).join(', ')}.` : named.length ? `Boxes already ${mode} on ${named.map(t => t.camera).join(', ')}.` : `Boxes ${mode} for the next /cam.` }
+      }
+      if (words[0] === 'watch') {
+        const usage = { text: 'Usage: /cam watch <id> person|vehicle [l,t,r,b] (ONVIF −1..1, y up, l<r, b<t) | /cam watch <id> off' }
+        const [, id, what, rectArg] = words
+        if (!id || !what || words.length > 4 || (what === 'off' && rectArg)) return usage
+        const t = tiles.find(x => x.camera === id)
+        if (!t) return { text: `Not on screen: ${id}. Showing: ${current.join(', ') || 'nothing'}.` }
+        if (what === 'off') {
+          t.watch = undefined
+          t.wake = undefined
+          if (t.running) void control($, t) // a stopped tile stays stopped
+          $.ui.invalidate('ui.render')
+          return { text: `Stopped watching ${t.camera}.` }
+        } else {
+          if (!Object.prototype.hasOwnProperty.call(CLASSES, what)) return usage
+          const cls = CLASSES[what]!
+          let rect: number[] | undefined
+          if (rectArg) {
+            const toks = rectArg.split(',')
+            if (toks.length !== 4 || toks.some(x => x.trim() === '')) return usage
+            rect = toks.map(Number)
+            if (rect.length !== 4 || !rect.every(v => Number.isFinite(v) && v >= -1 && v <= 1)) return usage
+            const [l, top, r, b] = rect as [number, number, number, number]
+            if (!(l < r && b < top)) return usage
+          }
+          t.watch = { cls, rev: ++watchRev, ...(rect ? { rect } : {}) }
+        }
+        t.wake = undefined
+        setMode($, [t], t.boxes) // writes the control file (watch rides beside boxes and size), or restarts a dead tile
+        return { text: `Watching ${t.camera} for ${what}${rectArg ? ` in ${rectArg}` : ''}.` }
       }
       const known = await registry($)
       if (words[0] === 'add') cameras = [...current, ...words.slice(1)]
@@ -344,7 +421,9 @@ export const register: Register = on => {
             {line.flatMap((t, ci) => {
               const tile = (
                 <Box key={`tile:${t.camera}`} flexDirection="column">
-                  <Text dimColor>{header(t, columns)}</Text>
+                  {(([pre, mid, post, alert]) => (
+                    <Text dimColor>{pre}{mid ? <Text dimColor={!alert} color={alert ? 'yellow' : undefined}>{mid}</Text> : null}{post}</Text>
+                  ))(header(t, columns))}
                   <Image key={`cam-${t.camera}`} source={BLACK} columns={columns} rows={rows} alt={`live view of ${t.camera}`} />
                 </Box>
               )

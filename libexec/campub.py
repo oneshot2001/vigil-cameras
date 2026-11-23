@@ -8,13 +8,22 @@ Lines:  {"tile":0,"shm":"/vc3f9a1c-0-17","w":640,"h":360}
         {"tile":0,"state":"connecting|live|reconnecting|stopped|error","camera":"q6358","ctl":"/…/ctl.json",...}
         {"tile":0,"stats":{"boxes":"live","objects":3,"box_age_ms":480,"meta_lag_ms":560,"held":0,"unmatched":2,"size":"1280x720"},"ctl":"…"}
         {"tile":0,"swap":{"size":"640x360","state":"starting|connecting|reconnecting|done|error",...}}
+        {"tile":0,"wake":{"cls":"Vehicle","rev":3,"n":7,"utc_ms":…}}
+        {"tile":0,"edge":{"state":"present|clear|unknown","mono_ms":…,"utc_ms":…,"seq":12}}
 
 Control (v0.4): the publisher owns a small JSON file, `ctl` on every state/stats line. The mod
-writes the whole desired state to it, `{"boxes":"live|aligned|off","size":"WxH"}`, and the
-publisher reads it every 0.25 s. A boxes change is applied on the running stream. A size
+writes the whole desired state to it, `{"boxes":"live|aligned|off","size":"WxH","watch":…}`, and
+the publisher reads it every 0.25 s. A boxes change is applied on the running stream. A size
 change opens a second RTSP session at the new size beside the running one and hands
 publication over once it has a decoded frame (the "swap" lines), so nothing goes black;
 the old session is then closed.
+
+Watch (v0.5): `"watch": {"cls":"Human|Vehicle","rect":[l,t,r,b],"rev":n}` (rect optional, ONVIF
+−1..1, y up) or null. The camera's own analytics documents decide: a watched-class object whose
+foot point is in the rectangle after REARM_S of observed absence is a `wake`. Every occupancy
+change is an `edge` line, so any rearm time can be replayed offline. One watch state per
+publisher, fed only by the owner stream; it starts from no baseline on every connection,
+promotion and watch change, so setting a watch never fires by itself.
 
 Two decoders:
   PyAV present     this process speaks RTSP itself (TCP interleaved, MD5 digest), depacketizes
@@ -207,6 +216,26 @@ class Want:
 
     def __init__(self, v):
         self.v = v
+        self.watch = None   # parse_watch() result, replaced whole; kept off `v` so a watch change never reads as a size change
+
+
+def parse_watch(d):
+    """The control file's watch → {"cls", "rect", "rev"} or None. ValueError/KeyError/TypeError when invalid."""
+    if d is None:
+        return None
+    cls, rev = d["cls"], d["rev"]
+    if cls not in WATCH_CLASSES or type(rev) is not int:
+        raise ValueError("watch")
+    rect = d.get("rect")
+    if rect is not None:
+        # exactly four JSON numbers in −1..1, range-checked before float() (a 400-digit integer overflows it)
+        if type(rect) is not list or len(rect) != 4 or not all(type(x) in (int, float) and -1 <= x <= 1 for x in rect):
+            raise ValueError("watch rect")
+        l, t, r, b = (float(x) for x in rect)
+        if not (l < r and b < t):
+            raise ValueError("watch rect")
+        rect = (l, t, r, b)
+    return {"cls": cls, "rect": rect, "rev": rev}
 
 
 class Control:
@@ -229,11 +258,13 @@ class Control:
             d = json.loads(raw)
             boxes = d["boxes"]
             w, h = (int(x) for x in str(d["size"]).lower().split("x"))
+            watch = parse_watch(d.get("watch"))
         except (ValueError, KeyError, TypeError, AttributeError):
             return False
         if boxes not in MODES or not (1 <= w <= MAX_DIM and 1 <= h <= MAX_DIM):
             return False
         self.applied = raw
+        self.want.watch = watch
         if self.want.v == (boxes, w, h):
             return False
         self.want.v = (boxes, w, h)
@@ -251,6 +282,7 @@ class Publisher:
         self.n = 0
         self.lock = threading.Lock()
         self.owner = None
+        self.watch = Watch()
 
     def publish(self, stream, frame, w, h):
         with self.lock:
@@ -266,8 +298,35 @@ class Publisher:
             if frame is None:
                 return False
             self.owner = stream
+            self._watch_out(self.watch.reset(time.monotonic()))   # the new owner starts from no baseline: one arrival never wakes twice
             self._publish(frame, stream.w, stream.h)
             return True
+
+    def _watch_out(self, events):
+        """Under self.lock: [("edge"|"wake", record)] in the order they happened."""
+        for kind, rec in events:
+            emit(tile=self.tile, **{kind: rec})
+
+    def watch_set(self, spec):
+        with self.lock:
+            self._watch_out(self.watch.set(spec, time.monotonic()))
+
+    def watch_reset(self, stream):
+        """A new connection: what happened while it was down is unknown, not absence."""
+        with self.lock:
+            if self.owner is stream:
+                self._watch_out(self.watch.reset(time.monotonic()))
+
+    def watch_feed(self, stream, frames, mono):
+        """One metadata document's frames, from the owner only, checked and emitted under the lock."""
+        with self.lock:
+            if self.owner is stream:
+                self._watch_out(self.watch.feed(frames, mono))
+
+    def watch_tick(self):
+        """From main's timer, so a silence (a reconnect included) turns unknown even with no stats line."""
+        with self.lock:
+            self._watch_out(self.watch.tick(time.monotonic()))
 
     def _publish(self, frame, w, h):
         if self.last:
@@ -344,11 +403,15 @@ class Stream(threading.Thread):
         with self.pub.lock:
             self.ready = None
 
-    def say(self, **kv):
+    def say(self, watch=None, **kv):
         """A state or stats line, from the owner only; a warming stream's state goes out as `swap`.
-        The lock is held through the write so a stream retired mid-call cannot speak after its successor."""
+        The lock is held through the write so a stream retired mid-call cannot speak after its successor.
+        `watch` (stats only): whether this stream can feed the watch; the watch part is read here, after
+        the owner check, so it is never a predecessor's."""
         with self.pub.lock:
             if self.pub.owner is self:
+                if watch is not None:
+                    kv["stats"]["watch"] = self.pub.watch.stats(watch)
                 emit(tile=self.a.tile, camera=self.a.camera, ctl=CTL, **kv)
                 return
         if "state" in kv:
@@ -453,7 +516,7 @@ class FfmpegStream(Stream):
                     if live and (now >= stats_at or self.stats_due):
                         stats_at = now + STATS_S
                         self.stats_due = False
-                        self.say(stats={"boxes": "off", "objects": 0, "box_age_ms": None, "size": f"{w}x{h}",
+                        self.say(watch=False, stats={"boxes": "off", "objects": 0, "box_age_ms": None, "size": f"{w}x{h}",
                                         "note": "PyAV not installed (pip3 install av); boxes off"})
                 proc.kill()
                 proc.wait()
@@ -486,6 +549,9 @@ HOLD_FLOOR_S, HOLD_CAP_S, HOLD_MARGIN_S = 0.6, 1.0, 0.1       # aligned: hold = 
 TCP_CONNECT_S = 3.0                                          # a LAN camera accepts in ms; longer means it is down, and stop must not wait
 LIVE_MAX_AGE = 3                                             # live: drop boxes older than this many metadata intervals
 STATS_S = 1.0
+REARM_S = 10.0   # watch: observed absence before a new arrival wakes. Provisional, from Frigate's VLM watch cooldown
+                 # (frigate/jobs/vlm_watch.py); the 2026-11 measurement day replays the edges to pick the real value
+WATCH_CLASSES = ("Human", "Vehicle")
 
 
 class RtspError(Exception):
@@ -859,13 +925,13 @@ class Boxes:
                 return k
         return None
 
-    def add(self, doc, mono):
+    def add(self, frames, mono):
         if self.last_arrival is not None:
             gap = (mono - self.last_arrival) * 1000
             if 0 < gap < 5000:
                 self.interval_ms = int(0.8 * self.interval_ms + 0.2 * gap)
         self.last_arrival = mono
-        for source, utc, objs in parse_metadata(doc):
+        for source, utc, objs in frames:
             self.docs[(source, utc)] = (objs, mono)
             self.latest[source] = (utc, objs, mono)
             k = self._near(self.frame_arrival, utc)
@@ -906,6 +972,117 @@ class Boxes:
             utc = max(u for u, _ in prev)
             return [o for u, (objs, _) in prev if u == utc for o in objs], cap - utc, True
         return [], None, False
+
+
+class Watch:
+    """Occupancy of one watched class (in an optional rectangle), from analytics documents only.
+    unknown → present | clear. A valid frame with an in-zone object is presence; one without is
+    observed absence; a metadata silence longer than REARM_S makes it unknown again. A wake is presence
+    after at least REARM_S of observed absence. From unknown the first frame only sets the baseline,
+    so a reset (new connection, promotion, changed watch) never wakes. Every state change is an edge,
+    a reset included, so an offline replay never mistakes a broken baseline for continuous absence.
+    Methods return [("edge"|"wake", record)] in the order things happened."""
+
+    def __init__(self):
+        self.spec = None
+        self.n = 0          # wakes, publisher-scoped: never jumps backward across a swap
+        self.seq = 0        # edges, so a lost stdout line shows as a gap
+        self.last = None    # newest wake under the current spec
+        self.k = 0          # wakes under the current spec: the mod counts lost lines from it
+        self.state = "unknown"
+        self.clear_since = None
+        self.last_doc = None
+        self.latest = {}    # source -> (in_zone, arrival_mono): occupancy, expires
+        self.hw = {}        # source -> newest utc_ms seen: stale-update guard, outlives occupancy expiry
+
+    def _edge(self, state, mono, utc):
+        self.state = state
+        self.seq += 1
+        return ("edge", {"state": state, "mono_ms": int(mono * 1000), "utc_ms": utc, "seq": self.seq})
+
+    def reset(self, mono):
+        edges = [self._edge("unknown", mono, None)] if self.spec is not None and self.state != "unknown" else []
+        self.state = "unknown"
+        self.clear_since = None
+        self.last_doc = None
+        self.latest = {}
+        self.hw = {}
+        return edges
+
+    def set(self, spec, mono):
+        if spec == self.spec:
+            return []
+        events = self.reset(mono)
+        self.spec = spec
+        self.last = None
+        self.k = 0
+        return events
+
+    def tick(self, mono):
+        """Metadata silence longer than REARM_S → unknown (checked once a second by the owner)."""
+        if self.spec is None or self.state == "unknown" or self.last_doc is None or mono - self.last_doc <= REARM_S:
+            return []
+        self.latest.clear()
+        self.clear_since = None
+        return [self._edge("unknown", mono, None)]
+
+    def in_zone(self, obj):
+        l, t, r, b, cls = obj
+        if cls != self.spec["cls"]:
+            return False
+        xmin, xmax = sorted((l, r))   # a Transformation can flip either axis
+        ymin, ymax = sorted((t, b))
+        if xmin == xmax or ymin == ymax:
+            return False
+        rect = self.spec["rect"]
+        if rect is None:
+            return True
+        fx, fy = (xmin + xmax) / 2, ymin   # foot point, y up
+        rl, rt, rr, rb = rect
+        return rl <= fx <= rr and rb <= fy <= rt
+
+    def feed(self, frames, mono):
+        """One document's frames, applied in camera-time order (frames sharing a time together)."""
+        if self.spec is None:
+            return []
+        events = self.tick(mono)
+        groups = {}
+        for source, u, objs in frames:
+            if u > self.hw.get(source, -1):
+                groups.setdefault(u, []).append((source, u, objs))
+        if not groups:
+            return events   # malformed or stale: not evidence either way
+        self.last_doc = mono
+        for u in sorted(groups):
+            for source, _, objs in groups[u]:
+                self.hw[source] = u
+                self.latest[source] = (any(self.in_zone(o) for o in objs), mono)
+            for src in [k for k, v in self.latest.items() if mono - v[1] > REARM_S]:
+                del self.latest[src]   # a source that went quiet stops holding presence
+            present = any(v[0] for v in self.latest.values())
+            if present and self.state != "present":
+                if self.state == "clear" and mono - self.clear_since >= REARM_S:
+                    self.n += 1
+                    self.k += 1
+                    self.last = {"cls": self.spec["cls"], "rev": self.spec["rev"], "n": self.n, "k": self.k, "utc_ms": u}
+                    events.append(("wake", self.last))
+                self.clear_since = None
+                events.append(self._edge("present", mono, u))
+            elif not present and self.state != "clear":
+                self.clear_since = mono
+                events.append(self._edge("clear", mono, u))
+        return events
+
+    def stats(self, available):
+        if self.spec is None:
+            return None
+        if not available:
+            state = "unavailable"
+        elif self.state == "unknown":
+            state = "waiting"
+        else:
+            state = "on"
+        return {"state": state, "cls": self.spec["cls"], "rev": self.spec["rev"], "wakes": self.n, "last": self.last}
 
 
 def sdp_tracks(sdp, base):
@@ -980,6 +1157,7 @@ class RtspStream(Stream):
                 if note:
                     errors.append(note)
                 rtsp.play(url)
+                self.pub.watch_reset(self)
 
                 ctx = av.CodecContext.create("h264", "r")
                 ctx.flags |= av.codec.context.Flags.low_delay
@@ -1031,7 +1209,10 @@ class RtspStream(Stream):
                                 if len(meta) > META_MAX:
                                     meta.clear()
                                 elif m_:
-                                    boxes.add(bytes(meta), now)   # fed in every mode, so a flip to live or aligned has boxes at once
+                                    frames_ = parse_metadata(bytes(meta))
+                                    boxes.add(frames_, now)   # fed in every mode, so a flip to live or aligned has boxes at once
+                                    if boxes_ok:
+                                        self.pub.watch_feed(self, frames_, now)   # boxes_ok false = coordinates unusable
                                     meta.clear()
                             else:
                                 r = None               # RTCP
@@ -1086,7 +1267,7 @@ class RtspStream(Stream):
                     if live and (now >= stats_at or self.stats_due):
                         stats_at = now + STATS_S
                         self.stats_due = False
-                        self.say(stats={"boxes": mode if boxes_ok else "off", "objects": objects, "box_age_ms": age,
+                        self.say(watch=boxes_ok, stats={"boxes": mode if boxes_ok else "off", "objects": objects, "box_age_ms": age,
                                         "held": boxes.held, "matched": boxes.matched, "unmatched": boxes.unmatched, "bad_packets": bad,
                                         "meta_lag_ms": int(max(l for _, l in boxes.lags) * 1000) if boxes.lags else None,
                                         "hold_ms": int(boxes.hold_s() * 1000) if mode == "aligned" and boxes_ok else 0,
@@ -1148,6 +1329,8 @@ def main():
         last_want = want.v[1:]
         while not stopping():
             control.poll()
+            pub.watch_set(want.watch)
+            pub.watch_tick()
             want_size = want.v[1:]
             if want_size != last_want:
                 last_want = want_size
