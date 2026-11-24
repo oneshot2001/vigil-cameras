@@ -20,7 +20,8 @@ the old session is then closed.
 
 Watch (v0.5): `"watch": {"cls":"Human|Vehicle","rect":[l,t,r,b],"rev":n}` (rect optional, ONVIF
 −1..1, y up) or null. The camera's own analytics documents decide: a watched-class object whose
-foot point is in the rectangle after REARM_S of observed absence is a `wake`. Every occupancy
+foot point is in the rectangle after REARM_S of observed absence, and stays for MIN_PRESENT_S of
+its class, is a `wake` (stamped with the arrival's camera time). Every occupancy
 change is an `edge` line, so any rearm time can be replayed offline. One watch state per
 publisher, fed only by the owner stream; it starts from no baseline on every connection,
 promotion and watch change, so setting a watch never fires by itself.
@@ -549,8 +550,11 @@ HOLD_FLOOR_S, HOLD_CAP_S, HOLD_MARGIN_S = 0.6, 1.0, 0.1       # aligned: hold = 
 TCP_CONNECT_S = 3.0                                          # a LAN camera accepts in ms; longer means it is down, and stop must not wait
 LIVE_MAX_AGE = 3                                             # live: drop boxes older than this many metadata intervals
 STATS_S = 1.0
-REARM_S = 10.0   # watch: observed absence before a new arrival wakes. Provisional, from Frigate's VLM watch cooldown
-                 # (frigate/jobs/vlm_watch.py); the 2026-11 measurement day replays the edges to pick the real value
+REARM_S = 10.0   # watch: observed absence before a new arrival wakes. Started from Frigate's VLM watch cooldown; kept after
+                 # a 24 h, 5-watch measurement (2026-11-23): person wakes/h were flat from 5 to 20 s
+MIN_PRESENT_S = {"Vehicle": 1.0}   # watch: camera-time a presence must last to wake (others: 0). Same measurement: 1493 of
+                                   # 1499 vehicle wakes on one camera were analytics flicker shorter than 1 s; half of real
+                                   # person visits on another lasted under 1.6 s, so people are not held
 WATCH_CLASSES = ("Human", "Vehicle")
 
 
@@ -978,7 +982,8 @@ class Watch:
     """Occupancy of one watched class (in an optional rectangle), from analytics documents only.
     unknown → present | clear. A valid frame with an in-zone object is presence; one without is
     observed absence; a metadata silence longer than REARM_S makes it unknown again. A wake is presence
-    after at least REARM_S of observed absence. From unknown the first frame only sets the baseline,
+    after at least REARM_S of observed absence that lasts MIN_PRESENT_S of its class in camera time;
+    a shorter presence still breaks the absence (it is an edge) but never wakes. From unknown the first frame only sets the baseline,
     so a reset (new connection, promotion, changed watch) never wakes. Every state change is an edge,
     a reset included, so an offline replay never mistakes a broken baseline for continuous absence.
     Methods return [("edge"|"wake", record)] in the order things happened."""
@@ -991,6 +996,7 @@ class Watch:
         self.k = 0          # wakes under the current spec: the mod counts lost lines from it
         self.state = "unknown"
         self.clear_since = None
+        self.arrival = None  # camera utc_ms of a presence that wakes once it has lasted MIN_PRESENT_S
         self.last_doc = None
         self.latest = {}    # source -> (in_zone, arrival_mono): occupancy, expires
         self.hw = {}        # source -> newest utc_ms seen: stale-update guard, outlives occupancy expiry
@@ -1004,6 +1010,7 @@ class Watch:
         edges = [self._edge("unknown", mono, None)] if self.spec is not None and self.state != "unknown" else []
         self.state = "unknown"
         self.clear_since = None
+        self.arrival = None
         self.last_doc = None
         self.latest = {}
         self.hw = {}
@@ -1024,7 +1031,18 @@ class Watch:
             return []
         self.latest.clear()
         self.clear_since = None
+        self.arrival = None
         return [self._edge("unknown", mono, None)]
+
+    def _held(self, u):
+        """The pending arrival wakes once it has been present MIN_PRESENT_S of its class (camera time)."""
+        if self.arrival is None or u - self.arrival < MIN_PRESENT_S.get(self.spec["cls"], 0.0) * 1000:
+            return []
+        self.n += 1
+        self.k += 1
+        self.last = {"cls": self.spec["cls"], "rev": self.spec["rev"], "n": self.n, "k": self.k, "utc_ms": self.arrival}
+        self.arrival = None
+        return [("wake", self.last)]
 
     def in_zone(self, obj):
         l, t, r, b, cls = obj
@@ -1054,21 +1072,24 @@ class Watch:
             return events   # malformed or stale: not evidence either way
         self.last_doc = mono
         for u in sorted(groups):
+            seen = False   # a frame at u itself shows the class in zone: only that can complete a hold
             for source, _, objs in groups[u]:
                 self.hw[source] = u
                 self.latest[source] = (any(self.in_zone(o) for o in objs), mono)
+                seen = seen or self.latest[source][0]
             for src in [k for k, v in self.latest.items() if mono - v[1] > REARM_S]:
                 del self.latest[src]   # a source that went quiet stops holding presence
             present = any(v[0] for v in self.latest.values())
             if present and self.state != "present":
                 if self.state == "clear" and mono - self.clear_since >= REARM_S:
-                    self.n += 1
-                    self.k += 1
-                    self.last = {"cls": self.spec["cls"], "rev": self.spec["rev"], "n": self.n, "k": self.k, "utc_ms": u}
-                    events.append(("wake", self.last))
+                    self.arrival = u
                 self.clear_since = None
+                events += self._held(u) if seen else []   # no hold for this class: the wake comes before its edge
                 events.append(self._edge("present", mono, u))
-            elif not present and self.state != "clear":
+            elif present:
+                events += self._held(u) if seen else []
+            elif self.state != "clear":
+                self.arrival = None
                 self.clear_since = mono
                 events.append(self._edge("clear", mono, u))
         return events

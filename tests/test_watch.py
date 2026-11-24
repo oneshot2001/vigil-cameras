@@ -36,7 +36,17 @@ def watch(cls="Vehicle", rect=None, rev=1):
     return w
 
 
-class WatchRules(unittest.TestCase):
+class NoHold(unittest.TestCase):
+    """Rearm and occupancy rules on their own: the class minimum-present hold is tested in HoldRule."""
+    def setUp(self):
+        self._hold = campub.MIN_PRESENT_S
+        campub.MIN_PRESENT_S = {}
+
+    def tearDown(self):
+        campub.MIN_PRESENT_S = self._hold
+
+
+class WatchRules(NoHold):
     def run_seq(self, w, seq, c=None):
         """seq: (seconds after previous doc, objs…) → list of wakes."""
         c = c or Clock()
@@ -162,8 +172,68 @@ class Owner:
     """A stand-in stream: the Publisher only compares identity and reads ready/w/h."""
 
 
-class Promotion(unittest.TestCase):
+class HoldRule(unittest.TestCase):
+    """Real MIN_PRESENT_S: Vehicle 1 s, Human none."""
+    run_seq = WatchRules.run_seq
+    ARM = [(0.1,)] + [(1.0,)] * int(R)
+
+    def test_values(self):
+        self.assertEqual(campub.MIN_PRESENT_S, {"Vehicle": 1.0})
+
+    def test_vehicle_flicker_never_wakes(self):
+        w = watch()
+        self.assertEqual(self.run_seq(w, self.ARM + [(0.1, CAR)] * 5 + [(0.1,)]), [])   # 0.4 s of car
+        self.assertEqual(w.n, 0)
+
+    def test_vehicle_wakes_once_after_hold_with_arrival_time(self):
+        c = Clock()
+        w = watch()
+        self.run_seq(w, self.ARM, c)
+        arrival = c.utc + 100
+        wakes = self.run_seq(w, [(0.1, CAR)] * 15, c)   # 1.4 s of car
+        self.assertEqual([(x["n"], x["utc_ms"]) for x in wakes], [(1, arrival)])
+
+    def test_flicker_breaks_absence(self):
+        seq = self.ARM + [(0.1, CAR), (0.1,)] + [(1.0,)] * (int(R) - 2) + [(0.1, CAR)] * 15
+        self.assertEqual(self.run_seq(watch(), seq), [])   # the flicker restarted the REARM clock
+
+    def test_person_not_held(self):
+        wakes = self.run_seq(watch(cls="Human"), self.ARM + [(0.1, PERSON), (0.1,)])
+        self.assertEqual(len(wakes), 1)
+
+    def test_hold_spanning_one_batched_document(self):
+        w, c = watch(), Clock()
+        self.run_seq(w, self.ARM, c)
+        mono, utc = c.step(0.1)
+        events = w.feed([("0", utc, [CAR]), ("0", utc + 600, [CAR]), ("0", utc + 1000, [CAR])], mono)
+        self.assertEqual([(k, r.get("state"), r["utc_ms"]) for k, r in events],
+                         [("edge", "present", utc), ("wake", None, utc)])
+
+    def test_wake_not_before_hold(self):
+        w, c = watch(), Clock()
+        self.run_seq(w, self.ARM, c)
+        self.assertEqual(self.run_seq(w, [(0.1, CAR)] * 10, c), [])   # camera time 0 .. 0.9 s present
+        self.assertEqual(len(self.run_seq(w, [(0.1, CAR)], c)), 1)    # 1.0 s
+
+    def test_other_source_empty_frame_does_not_complete_hold(self):
+        w, c = watch(), Clock()
+        self.run_seq(w, self.ARM, c)
+        mono, utc = c.step(0.1)
+        self.assertEqual(split(w.feed(doc(utc, CAR, source="A"), mono))[1], [])
+        self.assertEqual(split(w.feed(doc(utc + 1000, source="B"), mono + 0.1))[1], [])   # empty B, later camera time
+        self.assertEqual(split(w.feed(doc(utc + 100, source="A"), mono + 0.2))[1], [])    # A: gone after 100 ms
+        self.assertEqual(w.n, 0)
+
+    def test_reset_cancels_pending_arrival(self):
+        w, c = watch(), Clock()
+        self.run_seq(w, self.ARM + [(0.1, CAR)], c)
+        w.reset(c.mono)
+        self.assertEqual(self.run_seq(w, [(0.1, CAR)] * 15, c), [])
+
+
+class Promotion(NoHold):
     def setUp(self):
+        super().setUp()
         self.out = []
         self._emit = campub.emit
         campub.emit = lambda **kv: self.out.append(kv)
@@ -180,6 +250,7 @@ class Promotion(unittest.TestCase):
 
     def tearDown(self):
         campub.emit = self._emit
+        super().tearDown()
 
     def wakes(self):
         return [o["wake"] for o in self.out if "wake" in o]
